@@ -1,18 +1,20 @@
 {
   "name": "minecraft-ai-steve",
-  "version": "1.0.0",
-  "description": "Autonomous AI bot for Minecraft survival using Mineflayer",
+  "version": "2.0.0",
+  "description": "Production-grade autonomous Minecraft survival AI",
   "main": "src/main.js",
   "type": "commonjs",
   "scripts": {
-    "start": "node src/main.js"
+    "start": "node src/main.js",
+    "dev": "node --inspect src/main.js"
   },
   "dependencies": {
     "mineflayer": "^4.20.1",
     "mineflayer-pathfinder": "^2.4.5",
     "mineflayer-collectblock": "^1.4.1",
     "minecraft-data": "^3.62.0",
-    "vec3": "^0.1.8"
+    "vec3": "^0.1.8",
+    "prismarine-item": "^1.14.0"
   },
   "engines": {
     "node": ">=18"

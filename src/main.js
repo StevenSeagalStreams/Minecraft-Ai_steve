@@ -1,295 +1,358 @@
 "use strict";
 
+/**
+ * AI Steve — Main Entry Point
+ *
+ * Wires up every subsystem and runs the three-layer autonomous loop:
+ *
+ *   Layer 1 (every tick):   SurvivalManager   — health, hunger, hazards
+ *   Layer 2 (every tick):   BehaviourTree     — tactical decisions
+ *   Layer 3 (each plan):    GOAP Planner via StrategicPlanner + TacticalController
+ *
+ * The bot will never proceed past layer 1 if survival is threatened.
+ */
+
 const mineflayer = require("mineflayer");
-const config = require("../config");
+const path       = require("path");
 
-const { Perception } = require("./perception");
-const Navigation = require("./navigation");
-const InventoryManager = require("./inventoryManager");
-const ResourceManager = require("./resourceManager");
-const CraftingSystem = require("./craftingSystem");
-const StorageSystem = require("./storageSystem");
-const CombatSystem = require("./combatSystem");
-const SurvivalSystem = require("./survivalSystem");
-const BuildingSystem = require("./buildingSystem");
-const GoalPlanner = require("./goalPlanner");
-const MemorySystem = require("./memorySystem");
+// ── Infrastructure ────────────────────────────────────────────────────────────
+const config   = require("../config");
+const Logger   = require("./core/logger");
+const eventBus = require("./core/eventBus");
 
+// ── Memory + Perception ───────────────────────────────────────────────────────
+const MemorySystem = require("./memory/memorySystem");
+const { Perception } = require("./perception/perception");
+
+// ── Systems ───────────────────────────────────────────────────────────────────
+const Navigation       = require("./systems/navigation");
+const InventoryManager = require("./systems/inventoryManager");
+const CraftingSystem   = require("./systems/craftingSystem");
+const ResourceManager  = require("./systems/resourceManager");
+const CombatSystem     = require("./systems/combatSystem");
+const StorageSystem    = require("./systems/storageSystem");
+const BaseManager      = require("./systems/baseManager");
+const FarmingSystem    = require("./systems/farmingSystem");
+const DeathRecovery    = require("./systems/deathRecovery");
+
+// ── AI ────────────────────────────────────────────────────────────────────────
+const SurvivalManager    = require("./ai/survivalManager");
+const RiskAssessor       = require("./ai/riskAssessor");
+const StrategicPlanner   = require("./ai/strategicPlanner");
+const TacticalController = require("./ai/tacticalController");
+const { buildSurvivalTree, buildTacticalTree } = require("./ai/behaviorTree/trees");
+const { capture }          = require("./ai/goap/worldState");
+const { ProgressionTracker } = require("./progression/progressionTracker");
+
+// FSM states
 const STATES = {
-  IDLE: "IDLE",
-  EXPLORE: "EXPLORE",
-  GATHER: "GATHER",
-  CRAFT: "CRAFT",
-  BUILD: "BUILD",
-  COMBAT: "COMBAT",
-  SURVIVE: "SURVIVE",
+  BOOTING:    "BOOTING",
+  SURVIVAL:   "SURVIVAL",
+  RECOVERING: "RECOVERING",
+  TACTICAL:   "TACTICAL",
+  PLANNING:   "PLANNING",
 };
 
-/**
- * Central controller: owns the bot connection, wires up every subsystem
- * and runs the top-level state machine that drives autonomous behaviour.
- */
 class AiSteve {
-  constructor(cfg) {
-    this.config = cfg;
-    this.state = STATES.IDLE;
-    this.bot = null;
-    this.running = false;
-    this.currentTask = null;
+  constructor() {
+    this.logger    = new Logger(config);
+    this.state     = STATES.BOOTING;
+    this.bot       = null;
+    this.systems   = {};
+    this._running  = false;
+    this._tickCount = 0;
+    this._lastPerceptionTime = 0;
+    this._lastSaveTime = 0;
+    this._survived = false;
+    this._hasDied  = false;
   }
+
+  // ─── Connect ──────────────────────────────────────────────────────────────
 
   connect() {
+    this.logger.info("Main", `Connecting to ${config.host}:${config.port} as ${config.username}`);
     this.bot = mineflayer.createBot({
-      host: this.config.host,
-      port: this.config.port,
-      username: this.config.username,
-      password: this.config.password,
-      auth: this.config.auth,
-      version: this.config.version,
+      host:     config.host,
+      port:     config.port,
+      username: config.username,
+      password: config.password,
+      auth:     config.auth,
+      version:  config.version,
     });
 
-    this.bot.once("spawn", () => this._onSpawn());
-    this.bot.on("kicked", (reason) => console.error("[AiSteve] Kicked:", reason));
-    this.bot.on("error", (err) => console.error("[AiSteve] Error:", err));
-    this.bot.on("death", () => this._onDeath());
-    this.bot.on("end", () => {
-      console.log("[AiSteve] Disconnected.");
-      this.running = false;
-    });
+    this.bot.once("spawn",   ()        => this._onSpawn());
+    this.bot.on("kicked",    (reason)  => this.logger.error("Main", "Kicked", { reason }));
+    this.bot.on("error",     (err)     => this.logger.error("Main", "Error", { msg: err.message }));
+    this.bot.on("death",     ()        => this._onDeath());
+    this.bot.on("end",       ()        => this._onDisconnect());
+    this.bot.on("physicsTick", ()      => this._quickTick());
   }
 
+  // ─── Spawn ────────────────────────────────────────────────────────────────
+
   _onSpawn() {
-    console.log("[AiSteve] Spawned. Initializing subsystems...");
+    this.logger.info("Main", "Spawned — initialising subsystems");
 
-    this.memory = new MemorySystem();
-    this.perception = new Perception(this.bot);
-    this.navigation = new Navigation(this.bot);
-    this.inventory = new InventoryManager(this.bot, this.config);
-    this.resources = new ResourceManager(
-      this.bot,
-      this.perception,
-      this.navigation,
-      this.inventory,
-      this.memory
-    );
-    this.crafting = new CraftingSystem(this.bot, this.navigation, this.inventory, this.memory);
-    this.storage = new StorageSystem(this.bot, this.navigation, this.inventory, this.memory);
-    this.combat = new CombatSystem(
-      this.bot,
-      this.perception,
-      this.navigation,
-      this.inventory,
-      this.memory,
-      this.config
-    );
-    this.survival = new SurvivalSystem(
-      this.bot,
-      this.perception,
-      this.navigation,
-      this.inventory,
-      this.memory,
-      this.config
-    );
-    this.building = new BuildingSystem(this.bot, this.navigation, this.inventory, this.memory);
-    this.goalPlanner = new GoalPlanner(this.inventory, this.memory, this.building);
+    // Infrastructure
+    const memory = new MemorySystem(config, this.logger);
+    const perception = new Perception(this.bot, this.logger);
 
-    this.running = true;
+    // Systems
+    const navigation = new Navigation(this.bot, config, this.logger, eventBus);
+    const inventory  = new InventoryManager(this.bot, config, this.logger);
+    const crafting   = new CraftingSystem(this.bot, navigation, inventory, memory, this.logger, eventBus);
+    const resources  = new ResourceManager(this.bot, perception, navigation, inventory, memory, this.logger, eventBus);
+    const combat     = new CombatSystem(this.bot, perception, navigation, inventory, memory, this.logger, config, eventBus);
+    const storage    = new StorageSystem(this.bot, navigation, inventory, memory, crafting, this.logger, eventBus);
+    const base       = new BaseManager(this.bot, navigation, inventory, crafting, storage, memory, this.logger, eventBus, config);
+    const farming    = new FarmingSystem(this.bot, navigation, inventory, crafting, memory, this.logger);
+    const survival   = new SurvivalManager(this.bot, perception, navigation, inventory, memory, config, this.logger, eventBus);
+
+    // Death recovery (auto-hooks bot death event)
+    const recovery   = new DeathRecovery(this.bot, perception, navigation, inventory, crafting, storage, memory, this.logger, config, eventBus);
+
+    // AI
+    const risk       = new RiskAssessor(config, this.logger);
+    const progression = new ProgressionTracker(inventory, memory, this.logger);
+    const strategic  = new StrategicPlanner({ bot: this.bot, ...this._sysMap() }, config, this.logger, eventBus);
+    const tactical   = new TacticalController({ bot: this.bot, survival, combat, resources, crafting, storage, base, farming, navigation, inventory, perception, memory }, config, this.logger, eventBus);
+
+    // Behaviour trees
+    const survivalTree = buildSurvivalTree();
+    const tacticalTree = buildTacticalTree();
+
+    this.systems = {
+      memory, perception, navigation, inventory, crafting,
+      resources, combat, storage, base, farming, survival, recovery,
+      risk, progression, strategic, tactical, survivalTree, tacticalTree,
+    };
+
+    // Event listeners
+    this._attachEventListeners();
+
+    // Begin main loop
+    this._running  = true;
+    this.state     = STATES.SURVIVAL;
     this._mainLoop();
   }
 
-  _onDeath() {
-    console.log("[AiSteve] Died. Respawning and marking danger zone.");
-    this.memory.incrementStat("deaths");
-    if (this.bot.entity) {
-      this.memory.markDanger(this.bot.entity.position, 10, "death");
-    }
-    this.state = STATES.IDLE;
+  _sysMap() {
+    // Placeholder — real map provided after systems are built
+    return {};
   }
 
+  // ─── Event listeners ──────────────────────────────────────────────────────
+
+  _attachEventListeners() {
+    const { memory, logger } = this.systems;
+
+    eventBus.on("death:occurred", ({ position, items }) => {
+      logger.warn("Main", `Death at ${JSON.stringify(position)}`);
+      this._hasDied = true;
+      this.state = STATES.RECOVERING;
+    });
+
+    eventBus.on("base:built", ({ phase }) => {
+      logger.info("Main", `Base phase ${phase} established`);
+    });
+
+    eventBus.on("combat:start", ({ target }) => {
+      logger.info("Main", `Combat: engaging ${target}`);
+    });
+
+    eventBus.on("combat:end", ({ target, success }) => {
+      if (success) memory.increment("mobsKilled");
+    });
+
+    // Periodic stats emit
+    setInterval(() => {
+      this.logger.telemetry("stats", {
+        health:     this.bot?.health,
+        food:       this.bot?.food,
+        pos:        this.bot?.entity?.position,
+        state:      this.state,
+        stage:      this.systems.progression?.currentStage()?.name,
+        stats:      this.systems.memory?.stats,
+        logCounts:  this.logger.stats(),
+      });
+    }, 30000);
+  }
+
+  // ─── Quick per-physics-tick checks ────────────────────────────────────────
+  // (keeps the bot from taking damage while the main async loop is mid-task)
+
+  _quickTick() {
+    if (!this._running || !this.bot.entity) return;
+    // Auto-sprint unless we're in combat and need precise control
+    this.bot.setControlState("sprint", !this.systems.combat?.inCombat);
+  }
+
+  // ─── Main async loop ──────────────────────────────────────────────────────
+
   async _mainLoop() {
-    while (this.running) {
+    while (this._running) {
+      const tickStart = Date.now();
       try {
         await this._tick();
       } catch (err) {
-        console.error("[AiSteve] Tick error:", err.message);
+        this.logger.error("Main", `Tick error: ${err.message}`);
       }
-      await this._sleep(this.config.tickIntervalMs);
+      const elapsed = Date.now() - tickStart;
+      const wait    = Math.max(0, config.tickIntervalMs - elapsed);
+      await this._sleep(wait);
     }
   }
 
-  _sleep(ms) {
-    return new Promise((resolve) => setTimeout(resolve, ms));
-  }
-
-  /** One iteration of the behaviour state machine. */
   async _tick() {
-    if (!this.bot.entity) return;
+    this._tickCount++;
+    const { perception, survival, combat, strategic, tactical, progression, risk,
+            survivalTree, tacticalTree, memory, navigation, recovery } = this.systems;
 
-    const snapshot = this.perception.scan(24);
-
-    // Highest priority: survive (health/hunger/hazards) overrides everything.
-    if (this.survival.isCritical() || snapshot.hostileMobs.length > 0) {
-      this.state = snapshot.hostileMobs.length > 0 ? STATES.COMBAT : STATES.SURVIVE;
-    } else if (this.inventory.isFull()) {
-      this.state = STATES.BUILD; // route through storage handling
-    } else {
-      const task = this.goalPlanner.getNextTask();
-      this.currentTask = task;
-      this.state = this._taskToState(task);
+    // Refresh perception on schedule
+    const now = Date.now();
+    if (now - this._lastPerceptionTime >= config.perceptionIntervalMs) {
+      perception.scan(32);
+      this._lastPerceptionTime = now;
     }
 
-    console.log(`[AiSteve] State: ${this.state} | HP:${this.bot.health} Food:${this.bot.food}`);
-
-    switch (this.state) {
-      case STATES.COMBAT:
-        await this.combat.handleHostiles(snapshot.hostileMobs);
-        break;
-      case STATES.SURVIVE:
-        await this._handleSurvive(snapshot);
-        break;
-      case STATES.GATHER:
-        await this._handleGather(this.currentTask);
-        break;
-      case STATES.CRAFT:
-        await this._handleCraft(this.currentTask);
-        break;
-      case STATES.BUILD:
-        await this._handleBuild(this.currentTask);
-        break;
-      case STATES.EXPLORE:
-        await this._handleExplore();
-        break;
-      case STATES.IDLE:
-      default:
-        await this._sleep(500);
-        break;
-    }
-  }
-
-  _taskToState(task) {
-    if (task.type === "GATHER") return STATES.GATHER;
-    if (task.type === "BUILD") return STATES.BUILD;
-    if (task.type === "MAINTAIN") return STATES.EXPLORE;
-    return STATES.IDLE;
-  }
-
-  async _handleSurvive(snapshot) {
-    await this.survival.eatIfHungry();
-    await this.survival.avoidHazards();
-    await this.survival.checkVitals();
-
-    if (this.survival.shouldSeekShelter() && this.memory.hasBase()) {
-      try {
-        await this.navigation.goTo(this.memory.baseLocation, { range: 2, timeoutMs: 20000 });
-      } catch (_) {
-        // best effort
-      }
-    }
-  }
-
-  async _handleGather(task) {
-    if (!task) return;
-    let collected = 0;
-    if (task.resource === "wood") {
-      collected = await this.resources.gatherWood(task.amount);
-    } else if (task.resource === "stone") {
-      collected = await this.resources.gatherStone(task.amount);
-    } else if (task.resource === "iron") {
-      collected = await this.resources.gatherOre("iron", task.amount);
-      // Smelt raw iron into ingots if we have coal.
-      if (this.inventory.hasItem("raw_iron") && this.inventory.hasItem("coal")) {
-        await this.crafting.smelt("raw_iron", this.inventory.countItem("raw_iron"));
-      }
+    // Auto-save memory
+    if (now - this._lastSaveTime >= config.saveInterval) {
+      memory.save();
+      this._lastSaveTime = now;
     }
 
-    await this.resources.collectNearbyItems();
+    const snap = perception.last;
+    if (!snap) return;
 
-    if (collected === 0) {
-      // Nothing found nearby; explore to find more resources.
-      await this._handleExplore();
-    } else if (task.then) {
-      await this._handleCraft({ type: task.then });
-    }
-  }
+    // ── FSM ──────────────────────────────────────────────────────────────
 
-  async _handleCraft(task) {
-    if (!task) return;
-    switch (task.type) {
-      case "CRAFT_WOOD_TOOLS":
-        await this.crafting.craftWoodenToolSet();
-        break;
-      case "CRAFT_STONE_TOOLS":
-        await this.crafting.craftStoneToolSet();
-        break;
-      case "CRAFT_IRON_TOOLS":
-        await this.crafting.craftIronToolSet();
-        break;
-      default:
-        break;
-    }
-  }
-
-  async _handleBuild(task) {
-    if (this.inventory.isFull()) {
-      const deposited = await this.storage.depositExcess();
-      if (!deposited) await this.inventory.tossJunk();
+    // RECOVERING: post-death recovery takes priority until complete
+    if (this.state === STATES.RECOVERING) {
+      this.logger.info("Main", "State: RECOVERING");
+      const ok = await recovery.recover();
+      this.state = STATES.SURVIVAL;
+      this._hasDied = false;
+      strategic.reset();
       return;
     }
 
-    if (!task) return;
+    // Build survival context for behaviour tree
+    const btCtx = {
+      bot:        this.bot,
+      config,
+      survival,
+      combat,
+      navigation,
+      perception,
+      memory,
+      base:       this.systems.base,
+      farming:    this.systems.farming,
+      inventory:  this.systems.inventory,
+      resources:  this.systems.resources,
+      crafting:   this.systems.crafting,
+      storage:    this.systems.storage,
+      logger:     this.logger,
+    };
 
-    if (task.target === "shelter") {
-      if (this.building.hasEnoughMaterials()) {
-        await this.building.buildShelter();
-      } else {
-        await this.resources.gatherWood(8);
+    // ── Layer 1: Survival (always runs) ──────────────────────────────────
+    await survival.checkVitals();
+    await survival.avoidHazards();
+
+    const survResult = await survivalTree.tick(btCtx);
+    if (survResult === "FAILURE") {
+      this.logger.warn("Main", "Survival tree returned FAILURE — idling");
+      return;
+    }
+
+    // Abort tactical work if risk too high
+    const botStats = {
+      health:   this.bot.health,
+      food:     this.bot.food,
+      hasArmor: this.systems.inventory.has("iron_chestplate") || this.systems.inventory.has("diamond_chestplate"),
+      hasSword: !!this.systems.inventory.getBestTool("sword"),
+    };
+    if (risk.shouldAbort(snap, botStats)) {
+      this.logger.warn("Main", `Risk ${risk.assess(snap,botStats).toFixed(2)} — aborting tactical work`);
+      navigation.stop();
+      return;
+    }
+
+    // ── Layer 2: Tactical Behaviour Tree ─────────────────────────────────
+    this.state = STATES.TACTICAL;
+    await tacticalTree.tick(btCtx);
+
+    // ── Layer 3: GOAP Strategic Planner ──────────────────────────────────
+    // Only runs strategic planning once per 5 ticks to avoid overhead.
+    if (this._tickCount % 5 === 0) {
+      this.state = STATES.PLANNING;
+      const worldState = capture(this.bot, this.systems.inventory, memory, perception, this.systems.base);
+      const actionName  = strategic.nextAction(worldState, progression);
+
+      if (actionName && !tactical.isRunning) {
+        const success = await tactical.execute(actionName);
+        if (success) {
+          strategic.advance();
+          memory.recordSuccess(actionName);
+        } else {
+          memory.recordFailure(actionName);
+          strategic.reset();
+        }
       }
-    } else if (task.target === "storage") {
-      if (this.inventory.hasItem("chest")) {
-        await this.storage.placeChest();
-      } else if (this.inventory.hasItem("oak_planks", 8) || this.inventory.hasItem("oak_log", 2)) {
-        await this.crafting.craftItem("oak_planks", 8);
-        await this.crafting.craftItem("chest", 1);
-      } else {
-        await this.resources.gatherWood(8);
-      }
+    }
+
+    // ── Logging ──────────────────────────────────────────────────────────
+    if (this._tickCount % 20 === 0) {
+      const prog  = progression.summary(snap);
+      this.logger.info("Main",
+        `Tick:${this._tickCount} HP:${this.bot.health} Food:${this.bot.food} ` +
+        `Stage:[${prog.currentStage}] Action:[${tactical.currentAction ?? "idle"}] ` +
+        `Mobs:${snap.hostileMobs.length} Night:${snap.isNight}`
+      );
     }
   }
 
-  async _handleExplore() {
-    const pos = this.bot.entity.position;
-    const angle = Math.random() * Math.PI * 2;
-    const distance = 20;
-    const targetX = Math.round(pos.x + Math.cos(angle) * distance);
-    const targetZ = Math.round(pos.z + Math.sin(angle) * distance);
+  // ─── Lifecycle ────────────────────────────────────────────────────────────
 
-    try {
-      await this.navigation.goToXZ(targetX, targetZ, 20000);
-    } catch (_) {
-      // exploration failures are non-fatal; we'll just try a different direction next tick
-    }
+  _onDeath() {
+    this.logger.warn("Main", "Bot died");
+    this.systems.memory?.increment("deaths");
+    this.state = STATES.RECOVERING;
+  }
+
+  _onDisconnect() {
+    this.logger.info("Main", "Disconnected — saving memory");
+    this.systems.memory?.save();
+    this._running = false;
   }
 
   stop() {
-    this.running = false;
-    this.navigation?.stop();
+    this.logger.info("Main", "Shutting down");
+    this._running = false;
+    this.systems.navigation?.stop();
+    this.systems.memory?.save();
+    this.logger.close();
     this.bot?.quit();
   }
+
+  _sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 }
 
-function main() {
-  const steve = new AiSteve(config);
+// ─── Entry point ──────────────────────────────────────────────────────────────
+
+if (require.main === module) {
+  const steve = new AiSteve();
   steve.connect();
 
   process.on("SIGINT", () => {
-    console.log("\n[AiSteve] Shutting down...");
+    console.log("\nSIGINT — shutting down gracefully");
     steve.stop();
     process.exit(0);
   });
+  process.on("uncaughtException", (err) => {
+    console.error("Uncaught exception:", err);
+    steve.stop();
+    process.exit(1);
+  });
 }
 
-if (require.main === module) {
-  main();
-}
-
-module.exports = { AiSteve, STATES };
+module.exports = AiSteve;
