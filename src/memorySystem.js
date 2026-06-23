@@ -1,125 +1,222 @@
-"use strict";
+// ============================================================
+// modules/memorySystem.js — Persistent spatial memory for the bot
+// ============================================================
+// Stores: base location, resource deposits, danger zones,
+// known chest positions, and explored chunk sets.
+// Data is kept in-process; extend with JSON serialization for
+// persistence across restarts.
+// ============================================================
 
-/**
- * Persistent-in-memory knowledge store shared across all subsystems.
- * Keeps track of the base location, known resource clusters and danger
- * zones so the bot can make smarter decisions over time.
- */
+const { Vec3 } = require('vec3');
+
 class MemorySystem {
-  constructor() {
-    this.baseLocation = null; // { x, y, z }
-    this.resourceLocations = {
-      wood: [],
-      stone: [],
-      iron: [],
-      coal: [],
-      food: [],
-    };
-    this.dangerZones = []; // { x, y, z, radius, reason, timestamp }
-    this.chestLocations = [];
-    this.lastKnownGoal = null;
-    this.stats = {
-      blocksMined: 0,
-      mobsKilled: 0,
-      deaths: 0,
-      itemsCrafted: 0,
-    };
+  constructor(bot) {
+    this.bot = bot;
+
+    // --- Core memory stores ---
+    this.baseLocation = null;         // Vec3 — home position
+    this.bedLocation  = null;         // Vec3 — bed if placed
+
+    // Keyed by string "x,y,z" for O(1) lookup
+    this.resourceDeposits = new Map(); // pos → { type, lastSeen, richness }
+    this.dangerZones      = new Map(); // pos → { reason, timestamp }
+    this.chestLocations   = new Map(); // pos → { category, lastAudit }
+    this.craftingTables   = new Map(); // pos → { lastUsed }
+    this.furnaces         = new Map(); // pos → { lastUsed }
+
+    // Exploration tracking — rough 16-block grid cells
+    this.exploredCells = new Set();
+
+    // Short-term path blacklist — positions that caused the bot to get stuck
+    this.blacklistedPositions = new Map(); // pos → timestamp
+
+    console.log('[Memory] System initialised');
   }
 
-  setBase(position) {
-    this.baseLocation = { x: position.x, y: position.y, z: position.z };
+  // ---- Utility ------------------------------------------------
+
+  _key(pos) {
+    return `${Math.floor(pos.x)},${Math.floor(pos.y)},${Math.floor(pos.z)}`;
   }
 
-  hasBase() {
-    return this.baseLocation !== null;
+  _cellKey(pos) {
+    // Coarsen to 16-block cells
+    return `${Math.floor(pos.x / 16)},${Math.floor(pos.z / 16)}`;
   }
 
-  remember(type, position) {
-    if (!this.resourceLocations[type]) this.resourceLocations[type] = [];
-    const exists = this.resourceLocations[type].some(
-      (p) => p.x === position.x && p.y === position.y && p.z === position.z
-    );
-    if (!exists) {
-      this.resourceLocations[type].push({
-        x: position.x,
-        y: position.y,
-        z: position.z,
-        discoveredAt: Date.now(),
-      });
-    }
+  _now() {
+    return Date.now();
   }
 
-  getNearestResource(type, position) {
-    const list = this.resourceLocations[type] || [];
-    if (list.length === 0) return null;
-    let nearest = null;
-    let nearestDist = Infinity;
-    for (const loc of list) {
-      const dist =
-        (loc.x - position.x) ** 2 +
-        (loc.y - position.y) ** 2 +
-        (loc.z - position.z) ** 2;
-      if (dist < nearestDist) {
-        nearestDist = dist;
-        nearest = loc;
+  // ---- Base location ------------------------------------------
+
+  setBase(pos) {
+    this.baseLocation = pos.clone ? pos.clone() : new Vec3(pos.x, pos.y, pos.z);
+    console.log(`[Memory] Base location recorded: ${this._key(this.baseLocation)}`);
+  }
+
+  getBase() {
+    return this.baseLocation;
+  }
+
+  // ---- Resource deposits --------------------------------------
+
+  /**
+   * Record that a resource type was found at pos.
+   * @param {Vec3}   pos
+   * @param {string} type  — block name e.g. 'oak_log'
+   */
+  addResourceDeposit(pos, type) {
+    const key = this._key(pos);
+    this.resourceDeposits.set(key, {
+      type,
+      pos: { x: pos.x, y: pos.y, z: pos.z },
+      lastSeen: this._now(),
+    });
+  }
+
+  /**
+   * Returns the nearest known deposit of a given type,
+   * or null if none are remembered.
+   */
+  getNearestDeposit(type, fromPos) {
+    let best = null;
+    let bestDist = Infinity;
+
+    for (const [, entry] of this.resourceDeposits) {
+      if (entry.type !== type) continue;
+      const p = entry.pos;
+      const d = fromPos.distanceTo(new Vec3(p.x, p.y, p.z));
+      if (d < bestDist) {
+        bestDist = d;
+        best = entry;
       }
     }
-    return nearest;
+    return best;
   }
 
-  markDanger(position, radius, reason) {
-    this.dangerZones.push({
-      x: position.x,
-      y: position.y,
-      z: position.z,
-      radius,
+  /** Remove a deposit (e.g. after it has been fully mined). */
+  removeDeposit(pos) {
+    this.resourceDeposits.delete(this._key(pos));
+  }
+
+  getAllDeposits(type) {
+    const results = [];
+    for (const [, entry] of this.resourceDeposits) {
+      if (!type || entry.type === type) results.push(entry);
+    }
+    return results;
+  }
+
+  // ---- Danger zones -------------------------------------------
+
+  addDangerZone(pos, reason = 'unknown') {
+    this.dangerZones.set(this._key(pos), {
+      pos: { x: pos.x, y: pos.y, z: pos.z },
       reason,
-      timestamp: Date.now(),
+      timestamp: this._now(),
     });
-    // Cap memory growth
-    if (this.dangerZones.length > 200) this.dangerZones.shift();
+    console.log(`[Memory] Danger zone noted at ${this._key(pos)}: ${reason}`);
   }
 
-  isDangerous(position) {
-    return this.dangerZones.some((zone) => {
-      const dist = Math.sqrt(
-        (zone.x - position.x) ** 2 +
-          (zone.y - position.y) ** 2 +
-          (zone.z - position.z) ** 2
-      );
-      return dist <= zone.radius;
+  isDangerous(pos, radius = 8) {
+    for (const [, zone] of this.dangerZones) {
+      const zp = new Vec3(zone.pos.x, zone.pos.y, zone.pos.z);
+      if (pos.distanceTo(zp) <= radius) return true;
+    }
+    return false;
+  }
+
+  // ---- Chests -------------------------------------------------
+
+  addChest(pos, category = 'general') {
+    this.chestLocations.set(this._key(pos), {
+      pos: { x: pos.x, y: pos.y, z: pos.z },
+      category,
+      lastAudit: this._now(),
     });
   }
 
-  addChest(position) {
-    const exists = this.chestLocations.some(
-      (p) => p.x === position.x && p.y === position.y && p.z === position.z
-    );
-    if (!exists) {
-      this.chestLocations.push({ x: position.x, y: position.y, z: position.z });
+  getChests(category = null) {
+    const results = [];
+    for (const [, chest] of this.chestLocations) {
+      if (!category || chest.category === category) results.push(chest);
     }
+    return results;
   }
 
-  getNearestChest(position) {
-    if (this.chestLocations.length === 0) return null;
-    let nearest = null;
-    let nearestDist = Infinity;
-    for (const loc of this.chestLocations) {
-      const dist =
-        (loc.x - position.x) ** 2 +
-        (loc.y - position.y) ** 2 +
-        (loc.z - position.z) ** 2;
-      if (dist < nearestDist) {
-        nearestDist = dist;
-        nearest = loc;
-      }
-    }
-    return nearest;
+  getNearestChest(fromPos, category = null) {
+    const chests = this.getChests(category);
+    if (!chests.length) return null;
+    return chests.reduce((best, c) => {
+      const cp = new Vec3(c.pos.x, c.pos.y, c.pos.z);
+      const bd = best ? fromPos.distanceTo(new Vec3(best.pos.x, best.pos.y, best.pos.z)) : Infinity;
+      return fromPos.distanceTo(cp) < bd ? c : best;
+    }, null);
   }
 
-  incrementStat(key, amount = 1) {
-    if (this.stats[key] === undefined) this.stats[key] = 0;
-    this.stats[key] += amount;
+  // ---- Crafting tables / Furnaces -----------------------------
+
+  addCraftingTable(pos) {
+    this.craftingTables.set(this._key(pos), { pos: { x: pos.x, y: pos.y, z: pos.z }, lastUsed: null });
+  }
+
+  getNearestCraftingTable(fromPos) {
+    return this._nearest(this.craftingTables, fromPos);
+  }
+
+  addFurnace(pos) {
+    this.furnaces.set(this._key(pos), { pos: { x: pos.x, y: pos.y, z: pos.z }, lastUsed: null });
+  }
+
+  getNearestFurnace(fromPos) {
+    return this._nearest(this.furnaces, fromPos);
+  }
+
+  _nearest(map, fromPos) {
+    let best = null;
+    let bestDist = Infinity;
+    for (const [, entry] of map) {
+      const ep = new Vec3(entry.pos.x, entry.pos.y, entry.pos.z);
+      const d = fromPos.distanceTo(ep);
+      if (d < bestDist) { bestDist = d; best = entry; }
+    }
+    return best;
+  }
+
+  // ---- Exploration --------------------------------------------
+
+  markExplored(pos) {
+    this.exploredCells.add(this._cellKey(pos));
+  }
+
+  isExplored(pos) {
+    return this.exploredCells.has(this._cellKey(pos));
+  }
+
+  // ---- Stuck blacklist ----------------------------------------
+
+  blacklistPosition(pos) {
+    this.blacklistedPositions.set(this._key(pos), this._now());
+  }
+
+  isBlacklisted(pos) {
+    const ts = this.blacklistedPositions.get(this._key(pos));
+    if (!ts) return false;
+    // Blacklist expires after 5 minutes
+    return (this._now() - ts) < 5 * 60 * 1000;
+  }
+
+  // ---- Status summary -----------------------------------------
+
+  summary() {
+    return {
+      base: this.baseLocation ? this._key(this.baseLocation) : 'unset',
+      deposits: this.resourceDeposits.size,
+      dangerZones: this.dangerZones.size,
+      chests: this.chestLocations.size,
+      exploredCells: this.exploredCells.size,
+    };
   }
 }
 

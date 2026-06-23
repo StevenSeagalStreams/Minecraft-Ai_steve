@@ -1,168 +1,370 @@
-"use strict";
+// ============================================================
+// modules/craftingSystem.js — Automated crafting subsystem
+// ============================================================
+// Handles:
+//   • 2×2 (inventory) crafting for planks, sticks, crafting table
+//   • 3×3 (table) crafting for all tools
+//   • Furnace smelting (iron, food)
+//   • Dynamic recipe lookup via mineflayer registry
+//   • Placing / finding crafting tables and furnaces
+// ============================================================
 
-/**
- * Handles dynamic crafting (using the bot's recipe lookup) and smelting
- * via a furnace. Automatically places a crafting table / furnace from
- * inventory if one isn't already nearby.
- */
+const { Vec3 } = require('vec3');
+const config   = require('./config');
+
 class CraftingSystem {
-  constructor(bot, navigation, inventory, memory) {
-    this.bot = bot;
+  constructor(bot, inventory, navigation, memory) {
+    this.bot        = bot;
+    this.inventory  = inventory;
     this.navigation = navigation;
-    this.inventory = inventory;
-    this.memory = memory;
+    this.memory     = memory;
+
+    console.log('[Crafting] System initialised');
   }
 
-  findNearbyBlock(name, radius = 16) {
-    const block = this.bot.findBlock({
-      matching: (b) => b && b.name === name,
-      maxDistance: radius,
-    });
-    return block;
+  // ---- Item ID helper ----------------------------------------
+
+  _itemId(name) {
+    return this.bot.registry.itemsByName[name]?.id ?? null;
   }
 
-  async ensureCraftingTable() {
-    let table = this.findNearbyBlock("crafting_table");
-    if (table) {
-      await this.navigation.goNearBlock(table, 2).catch(() => null);
-      return table;
-    }
-
-    if (!this.inventory.hasItem("crafting_table")) {
-      return null; // caller should craft/obtain one first
-    }
-
-    return this._placeItemNearby("crafting_table");
-  }
-
-  async ensureFurnace() {
-    let furnace = this.findNearbyBlock("furnace");
-    if (furnace) {
-      await this.navigation.goNearBlock(furnace, 2).catch(() => null);
-      return furnace;
-    }
-
-    if (!this.inventory.hasItem("furnace")) {
-      return null;
-    }
-
-    return this._placeItemNearby("furnace");
-  }
-
-  async _placeItemNearby(itemName) {
-    const item = this.inventory.getItems().find((i) => i.name === itemName);
-    if (!item) return null;
-
-    const refBlock = this.bot.blockAt(this.bot.entity.position.offset(0, -1, 0));
-    if (!refBlock) return null;
-
-    try {
-      await this.bot.equip(item, "hand");
-      const placePos = this.bot.entity.position.offset(1, 0, 0);
-      const placeRefBlock = this.bot.blockAt(placePos.offset(0, -1, 0));
-      if (!placeRefBlock || placeRefBlock.name === "air") return null;
-      await this.bot.placeBlock(placeRefBlock, { x: 0, y: 1, z: 0 });
-      this.memory.incrementStat("itemsCrafted", 0);
-      return this.findNearbyBlock(itemName, 8);
-    } catch (err) {
-      return null;
-    }
-  }
+  // ---- Generic craft ------------------------------------------
 
   /**
-   * Crafts `count` of `itemName` using mineflayer's dynamic recipe API.
-   * Will use a crafting table when the recipe requires one.
+   * Craft `count` of `itemName`, using a crafting table if needed.
+   * Returns true on success.
    */
-  async craftItem(itemName, count = 1) {
-    const mcData = require("minecraft-data")(this.bot.version);
-    const itemData = mcData.itemsByName[itemName];
-    if (!itemData) return false;
-
-    let table = this.bot.findBlock({
-      matching: (b) => b && b.name === "crafting_table",
-      maxDistance: 8,
-    });
-
-    let recipes = this.bot.recipesFor(itemData.id, null, 1, table || null);
-    if (recipes.length === 0 && !table) {
-      table = await this.ensureCraftingTable();
-      recipes = this.bot.recipesFor(itemData.id, null, 1, table || null);
-    }
-
-    if (recipes.length === 0) return false;
-
-    const recipe = recipes[0];
-    try {
-      await this.bot.craft(recipe, count, table || null);
-      this.memory.incrementStat("itemsCrafted", count);
-      return true;
-    } catch (err) {
+  async craft(itemName, count = 1) {
+    const id = this._itemId(itemName);
+    if (id === null) {
+      console.warn(`[Crafting] Unknown item: ${itemName}`);
       return false;
     }
-  }
 
-  /** Smelts `inputName` into its smelted output using a furnace and fuel. */
-  async smelt(inputName, count, fuelName = "coal") {
-    const furnace = await this.ensureFurnace();
-    if (!furnace) return false;
-
-    const inputItem = this.inventory.getItems().find((i) => i.name === inputName);
-    const fuelItem = this.inventory.getItems().find((i) => i.name === fuelName);
-    if (!inputItem || !fuelItem) return false;
-
-    const furnaceWindow = await this.bot.openFurnace(furnace);
-    try {
-      await furnaceWindow.putFuel(fuelItem.type, null, Math.min(fuelItem.count, count));
-      await furnaceWindow.putInput(inputItem.type, null, count);
-
-      await new Promise((resolve) => {
-        const timer = setTimeout(resolve, count * 10000 + 5000);
-        furnaceWindow.once("update", () => {
-          clearTimeout(timer);
-          resolve();
-        });
-      });
-
-      const output = furnaceWindow.outputItem();
-      if (output) {
-        await furnaceWindow.takeOutput();
+    // Try inventory (2×2) crafting first
+    const invRecipes = this.bot.recipesFor(id, null, 1, null);
+    if (invRecipes.length > 0) {
+      try {
+        await this.bot.craft(invRecipes[0], count, null);
+        console.log(`[Crafting] Crafted ${count}x ${itemName} (inventory)`);
+        return true;
+      } catch (e) {
+        // May need crafting table
       }
-      return true;
-    } catch (err) {
+    }
+
+    // Try crafting table
+    const table = await this._ensureCraftingTable();
+    if (!table) return false;
+
+    const tableRecipes = this.bot.recipesFor(id, null, 1, table);
+    if (tableRecipes.length === 0) {
+      console.warn(`[Crafting] No recipe found for ${itemName}`);
       return false;
-    } finally {
-      furnaceWindow.close();
+    }
+
+    try {
+      await this.bot.craft(tableRecipes[0], count, table);
+      console.log(`[Crafting] Crafted ${count}x ${itemName} (table)`);
+      return true;
+    } catch (e) {
+      console.warn(`[Crafting] Failed to craft ${itemName}: ${e.message}`);
+      return false;
     }
   }
 
-  /** Crafts basic wooden tools assuming enough planks/sticks are available. */
-  async craftWoodenToolSet() {
-    await this.craftItem("oak_planks", 4);
-    await this.craftItem("stick", 4);
-    const results = {
-      pickaxe: await this.craftItem("wooden_pickaxe", 1),
-      axe: await this.craftItem("wooden_axe", 1),
-      sword: await this.craftItem("wooden_sword", 1),
-    };
-    return results;
+  // ---- Crafting table management ------------------------------
+
+  /**
+   * Ensures a crafting table is nearby and returns the block.
+   * Places one from inventory if none found in memory/world.
+   */
+  async _ensureCraftingTable() {
+    // Check if one is nearby already
+    let table = this.bot.findBlock({
+      matching: this.bot.registry.blocksByName['crafting_table'].id,
+      maxDistance: 4,
+    });
+    if (table) return table;
+
+    // Check memory for a known table
+    const remembered = this.memory.getNearestCraftingTable(this.bot.entity.position);
+    if (remembered) {
+      const pos = new Vec3(remembered.pos.x, remembered.pos.y, remembered.pos.z);
+      const arrived = await this.navigation.moveTo(pos, 3);
+      if (arrived) {
+        table = this.bot.blockAt(pos);
+        if (table?.name === 'crafting_table') return table;
+      }
+    }
+
+    // Craft a crafting table if we have planks / logs
+    if (!this.inventory.has('crafting_table')) {
+      const crafted = await this._craftCraftingTable();
+      if (!crafted) return null;
+    }
+
+    // Place the crafting table
+    return this._placeCraftingTable();
   }
 
-  async craftStoneToolSet() {
-    const results = {
-      pickaxe: await this.craftItem("stone_pickaxe", 1),
-      axe: await this.craftItem("stone_axe", 1),
-      sword: await this.craftItem("stone_sword", 1),
-    };
-    return results;
+  async _craftCraftingTable() {
+    // Make sure we have planks
+    await this._ensurePlanks(4);
+
+    const id = this._itemId('crafting_table');
+    if (!id) return false;
+    const recipes = this.bot.recipesFor(id, null, 1, null);
+    if (!recipes.length) return false;
+    try {
+      await this.bot.craft(recipes[0], 1, null);
+      return true;
+    } catch (e) {
+      return false;
+    }
   }
 
-  async craftIronToolSet() {
-    const results = {
-      pickaxe: await this.craftItem("iron_pickaxe", 1),
-      axe: await this.craftItem("iron_axe", 1),
-      sword: await this.craftItem("iron_sword", 1),
-    };
-    return results;
+  async _placeCraftingTable() {
+    const item = this.inventory.getItem('crafting_table');
+    if (!item) return null;
+
+    // Find a solid block in front of the bot to place against
+    const pos  = this.bot.entity.position.floored();
+    const candidates = [
+      pos.offset(1, 0, 0), pos.offset(-1, 0, 0),
+      pos.offset(0, 0, 1), pos.offset(0, 0, -1),
+    ];
+
+    for (const target of candidates) {
+      const ground = this.bot.blockAt(target.offset(0, -1, 0));
+      const above  = this.bot.blockAt(target);
+      if (!ground || ground.boundingBox !== 'block') continue;
+      if (above && above.name !== 'air') continue;
+
+      try {
+        await this.bot.equip(item, 'hand');
+        await this.bot.placeBlock(ground, new Vec3(0, 1, 0));
+        const placed = this.bot.blockAt(target);
+        if (placed?.name === 'crafting_table') {
+          this.memory.addCraftingTable(target);
+          console.log(`[Crafting] Placed crafting table at ${target}`);
+          return placed;
+        }
+      } catch (e) {
+        console.warn('[Crafting] Failed to place crafting table:', e.message);
+      }
+    }
+    return null;
+  }
+
+  // ---- Furnace management -------------------------------------
+
+  async _ensureFurnace() {
+    let furnace = this.bot.findBlock({
+      matching: this.bot.registry.blocksByName['furnace'].id,
+      maxDistance: 4,
+    });
+    if (furnace) return furnace;
+
+    // Check memory
+    const remembered = this.memory.getNearestFurnace(this.bot.entity.position);
+    if (remembered) {
+      const pos = new Vec3(remembered.pos.x, remembered.pos.y, remembered.pos.z);
+      await this.navigation.moveTo(pos, 3);
+      furnace = this.bot.blockAt(pos);
+      if (furnace?.name === 'furnace') return furnace;
+    }
+
+    // Craft + place
+    if (!this.inventory.has('furnace')) {
+      await this.craft('furnace');
+    }
+    return this._placeFurnace();
+  }
+
+  async _placeFurnace() {
+    const item = this.inventory.getItem('furnace');
+    if (!item) return null;
+
+    const pos = this.bot.entity.position.floored();
+    const candidates = [
+      pos.offset(2, 0, 0), pos.offset(-2, 0, 0),
+      pos.offset(0, 0, 2), pos.offset(0, 0, -2),
+    ];
+
+    for (const target of candidates) {
+      const ground = this.bot.blockAt(target.offset(0, -1, 0));
+      const above  = this.bot.blockAt(target);
+      if (!ground || ground.boundingBox !== 'block') continue;
+      if (above && above.name !== 'air') continue;
+
+      try {
+        await this.bot.equip(item, 'hand');
+        await this.bot.placeBlock(ground, new Vec3(0, 1, 0));
+        const placed = this.bot.blockAt(target);
+        if (placed?.name === 'furnace') {
+          this.memory.addFurnace(target);
+          console.log(`[Crafting] Placed furnace at ${target}`);
+          return placed;
+        }
+      } catch (e) {
+        console.warn('[Crafting] Failed to place furnace:', e.message);
+      }
+    }
+    return null;
+  }
+
+  // ---- Smelting -----------------------------------------------
+
+  /**
+   * Smelt `inputItem` into `outputItem` using coal as fuel.
+   * @param {string} inputItem   e.g. 'raw_iron'
+   * @param {string} outputItem  e.g. 'iron_ingot'
+   * @param {number} count
+   */
+  async smelt(inputItem, outputItem, count = 1) {
+    if (!this.inventory.has(inputItem, count)) {
+      console.warn(`[Crafting] Not enough ${inputItem} to smelt`);
+      return false;
+    }
+
+    const furnaceBlock = await this._ensureFurnace();
+    if (!furnaceBlock) {
+      console.warn('[Crafting] No furnace available');
+      return false;
+    }
+
+    // Move to furnace
+    await this.navigation.moveToBlock(furnaceBlock.position);
+
+    try {
+      const furnace = await this.bot.openFurnace(furnaceBlock);
+      await this._sleep(500);
+
+      // Check if we have fuel
+      const coalCount = this.inventory.count('coal') + this.inventory.count('charcoal');
+      const fuelNeeded = Math.ceil(count / 8); // ~8 items per coal
+      if (coalCount < fuelNeeded) {
+        // Use planks as fuel if no coal
+        const planks = this.inventory.getItem('oak_planks') ||
+                       this.inventory.getItem('birch_planks') ||
+                       this.inventory.getItem('spruce_planks');
+        if (planks) {
+          await furnace.putFuel(planks.type, null, Math.min(planks.count, fuelNeeded * 8));
+        }
+      } else {
+        const coal = this.inventory.getItem('coal') || this.inventory.getItem('charcoal');
+        if (coal) {
+          await furnace.putFuel(coal.type, null, Math.min(coal.count, fuelNeeded));
+        }
+      }
+
+      // Put input
+      const inputItem_ = this.inventory.getItem(inputItem);
+      if (inputItem_) {
+        await furnace.putInput(inputItem_.type, null, count);
+      }
+
+      // Wait for smelting (roughly 10 seconds per item)
+      console.log(`[Crafting] Smelting ${count}x ${inputItem}...`);
+      await this._sleep(count * 10000 + 2000);
+
+      // Take output
+      if (furnace.outputItem()) {
+        await furnace.takeOutput();
+      }
+
+      furnace.close();
+      console.log(`[Crafting] Smelted ${count}x ${inputItem} → ${outputItem}`);
+      return true;
+    } catch (e) {
+      console.warn(`[Crafting] Smelting failed: ${e.message}`);
+      return false;
+    }
+  }
+
+  // ---- High-level crafting goals ------------------------------
+
+  async craftWoodenTools() {
+    await this._ensurePlanks(7);
+    await this._ensureSticks(4);
+    await this.craft('wooden_pickaxe');
+    await this.craft('wooden_axe');
+    await this.craft('wooden_sword');
+  }
+
+  async craftStoneTools() {
+    const cobble = this.inventory.count('cobblestone');
+    if (cobble < 11) {
+      console.log('[Crafting] Not enough cobblestone for stone tools');
+      return false;
+    }
+    await this._ensureSticks(4);
+    await this.craft('stone_pickaxe');
+    await this.craft('stone_axe');
+    await this.craft('stone_sword');
+    return true;
+  }
+
+  async craftIronTools() {
+    // Need 11 iron ingots
+    const ingots = this.inventory.count('iron_ingot');
+    if (ingots < 11) {
+      // Try smelting raw iron
+      const rawIron = this.inventory.count('raw_iron');
+      if (rawIron > 0) {
+        await this.smelt('raw_iron', 'iron_ingot', Math.min(rawIron, 11 - ingots));
+      }
+    }
+    if (this.inventory.count('iron_ingot') < 11) return false;
+
+    await this._ensureSticks(4);
+    await this.craft('iron_pickaxe');
+    await this.craft('iron_axe');
+    await this.craft('iron_sword');
+    return true;
+  }
+
+  async craftTorches(count = 8) {
+    const coal = this.inventory.count('coal') + this.inventory.count('charcoal');
+    const sticks = this.inventory.count('stick');
+    const possible = Math.min(coal, sticks, Math.floor(count / 4));
+    if (possible === 0) return;
+    await this.craft('torch', possible);
+  }
+
+  // ---- Material helpers ---------------------------------------
+
+  async _ensurePlanks(count) {
+    const plankTypes = ['oak_planks','birch_planks','spruce_planks','dark_oak_planks'];
+    const have = plankTypes.reduce((s, p) => s + this.inventory.count(p), 0);
+    if (have >= count) return;
+
+    const logTypes = ['oak_log','birch_log','spruce_log','dark_oak_log'];
+    for (const log of logTypes) {
+      if (this.inventory.has(log)) {
+        const plankName = log.replace('_log', '_planks');
+        const id = this._itemId(plankName);
+        if (!id) continue;
+        const recipes = this.bot.recipesFor(id, null, 1, null);
+        if (recipes.length) {
+          try { await this.bot.craft(recipes[0], 1, null); } catch (_) {}
+        }
+        return;
+      }
+    }
+  }
+
+  async _ensureSticks(count) {
+    if (this.inventory.count('stick') >= count) return;
+    await this._ensurePlanks(2);
+    await this.craft('stick', Math.ceil(count / 4));
+  }
+
+  // ---- Utility ------------------------------------------------
+
+  _sleep(ms) {
+    return new Promise((r) => setTimeout(r, ms));
   }
 }
 
