@@ -1,4 +1,5 @@
-"use strict";
+const mineflayer  = require('mineflayer');
+const config      = require('./config');
 
 /**
  * AI Steve — Main Entry Point
@@ -298,6 +299,206 @@ class AiSteve {
           strategic.reset();
         }
       }
+      return;
+    }
+
+    // Healed back up after a retreat — go finish what we started instead
+    // of abandoning the fight permanently. Only do this if the original
+    // threat is still somewhat nearby; if we've wandered far away or a
+    // lot of time passed, just let normal goal logic resume instead.
+    if (this._retreatFromPos && this.combat.isHealedEnoughToReengage()) {
+      const distToOldFight = this.bot.entity.position.distanceTo(this._retreatFromPos);
+      if (distToOldFight < 30) {
+        console.log('[Bot] Healed up — returning to finish the fight');
+        this._setState(STATE.COMBAT);
+        await this.inv.equipBestSword();
+        await this.nav.moveTo(this._retreatFromPos, 4);
+        await this.combat.clearArea();
+      }
+      this._retreatFromPos = null;
+    }
+
+    if (threat === 'fight') {
+      if (world.isNight && !hasShelter) {
+        const mob = this.perception.nearestHostile();
+        if (mob) {
+          this._setState(STATE.SHELTER);
+          await this.nav.fleeFrom(mob.position, 24);
+        }
+      } else {
+        this._setState(STATE.COMBAT);
+        await this.inv.equipBestSword();
+        const before = this.bot.health;
+        await this.combat.clearArea();
+
+        const mob = this.perception.nearestHostile();
+        if (!mob) {
+          const dmgTaken = before - this.bot.health;
+          this.reward.record('MOB_KILLED', 'combat');
+          if (dmgTaken < 2) this.reward._updateWeight('fight', 'general', 2);
+          this._retreatFromPos = null; // fight resolved cleanly, nothing to return to
+        }
+        await this._autoEquipSword();
+      }
+      return;
+    }
+
+    // ── 3. Retrieve death items ──────────────────────────────
+    if (this.survival.hasPendingDeathRetrieval()) {
+      this._setState(STATE.RETRIEVE);
+      await this.survival.retrieveDeathItems();
+      return;
+    }
+
+    // ── 3.5 Return home after death if we have a shelter and wandered off ──
+    // Without this, the bot just starts gathering wood wherever it respawned,
+    // eventually wandering far enough that the old base gets abandoned and
+    // rebuilt from scratch every single life.
+    if (hasShelter) {
+      const base = this.memory.getBase();
+      if (base) {
+        const distFromBase = this.bot.entity.position.distanceTo(base);
+        if (distFromBase > 40 && this.inv.occupiedSlots() <= 2) {
+          this._setState(STATE.SHELTER);
+          console.log('[Bot] Heading back to base (' + Math.floor(distFromBase) + ' blocks away)');
+          await this.nav.moveTo(base, 5);
+          return;
+        }
+      }
+    }
+
+    // ── 4. Night ─────────────────────────────────────────────
+    if (world.isNight) {
+      const hasBed = !!this.memory.bedLocation;
+
+      if (hasShelter && hasBed && this.state !== STATE.SLEEP) {
+        this._setState(STATE.SLEEP);
+        await this._trySleep();
+        this.reward.record('SURVIVED_NIGHT', 'sleep');
+        return;
+      }
+
+      if (hasShelter && !hasBed) {
+        if (this.state !== STATE.SHELTER) {
+          this._setState(STATE.SHELTER);
+          const base = this.memory.getBase();
+          if (base) await this.nav.moveTo(base, 3);
+          this.nav.stop();
+          console.log('[Bot] Night — inside shelter, waiting for morning');
+        }
+        return;
+      }
+      // No shelter — keep working on goals but flee mobs (falls through)
+    }
+
+    // ── 5. Heal — when hurt, prioritize recovering HP over goal work ────
+    // This is separate from hunger-based eating below: even with decent
+    // food, the bot should react to having taken damage, not just wait
+    // until it's starving to eat.
+    const isHurt = world.health < 16; // out of 20 — meaningfully damaged
+    if (isHurt) {
+      if (this.inv.hasFood()) {
+        console.log('[Bot] Hurt (' + world.health + ' HP) — eating to recover');
+        await this.survival.eatUntilFull();
+        return;
+      }
+      // Emergency fallback: rotten flesh from zombie kills. Not in the
+      // normal foodItems list (food poisoning risk), but starving while
+      // hurt is worse than the risk — only used when nothing better exists.
+      if (this.inv.count('rotten_flesh') > 0) {
+        console.log('[Bot] Hurt with no good food — eating rotten flesh as emergency ration');
+        try {
+          const item = this.inv.getItem('rotten_flesh');
+          if (item) { await this.bot.equip(item, 'hand'); await this.bot.consume(); }
+        } catch(e) {}
+        return;
+      }
+      // No food — if it's night and we have a bed nearby, sleep to heal.
+      // Sleeping in vanilla Minecraft restores health over time same as
+      // food saturation, and skips the dangerous night entirely. During
+      // the day this isn't possible — health will recover slowly from
+      // saturation regardless, so we just continue more cautiously.
+      const bedPos = this.memory.bedLocation;
+      if (bedPos && hasShelter && world.isNight) {
+        const distToBed = this.bot.entity.position.distanceTo(bedPos);
+        if (distToBed < 30) {
+          console.log('[Bot] Hurt with no food — resting in bed to recover');
+          this._setState(STATE.SLEEP);
+          await this._trySleep();
+          return;
+        }
+      }
+      // Otherwise fall through — nothing more we can do right now,
+      // combat/flee logic above still applies and natural regen continues.
+    }
+
+    // ── 5.5 Eat — hunger-based, even when not specifically "hurt" ───────
+    if (world.food <= config.survival.hungerThreshold) {
+      if (this.inv.hasFood()) {
+        await this.survival.eatUntilFull();
+        return;
+      }
+      // Same emergency fallback for plain hunger, not just combat damage
+      if (this.inv.count('rotten_flesh') > 0) {
+        console.log('[Bot] Starving with no good food — eating rotten flesh');
+        try {
+          const item = this.inv.getItem('rotten_flesh');
+          if (item) { await this.bot.equip(item, 'hand'); await this.bot.consume(); }
+        } catch(e) {}
+        return;
+      }
+    }
+
+    // ── 6. Inventory full ───────────────────────────────────
+    if (world.inventoryFull) {
+      const deposited = await this.storage.depositItems();
+      if (!deposited) await this.inv.dropJunk();
+      return;
+    }
+
+    // ── 7. Goals ────────────────────────────────────────────
+    this._setState(STATE.GOAL);
+    const goal = this.planner.getActiveGoal();
+    if (!goal) {
+      this._setState(STATE.EXPLORE);
+      await this._autoEquipSword();
+      await this.nav.exploreStep();
+      return;
+    }
+
+    console.log('\n[Bot] Goal: ' + goal.id + ' | Task: ' + goal.taskName);
+    this.activityLog.logGoal(goal.id, goal.taskName);
+    try { this.bot.chat('[AI] ' + goal.id + ': ' + goal.taskName); } catch(e) {}
+
+    const result = await this.planner.runNextTask(goal);
+
+    if (result.success) {
+      if (goal.taskName.includes('craft')) {
+        this.reward.record('CRAFT_SUCCESS', goal.taskName);
+      }
+      if (goal.taskName === 'build_shelter' && this.building.isShelterBuilt()) {
+        this.reward.record('SHELTER_COMPLETED', 'shelter');
+        this.activityLog.logShelterProgress('completed', 'shelter built');
+      }
+      if (goal.taskName.includes('pickaxe') && goal.id === 'stone_tools') {
+        this.reward.record('TOOL_TIER_UPGRADE', 'stone');
+      }
+      if (goal.taskName.includes('pickaxe') && goal.id === 'iron') {
+        this.reward.record('TOOL_TIER_UPGRADE', 'iron');
+      }
+    } else {
+      this.reward.record('FAILED_CRAFT', goal.taskName);
+      console.warn(`[Bot] Task failed: ${result.taskName}`);
+    }
+
+    // Don't blindly re-equip the sword after every task — gather_wood/
+    // gather_stone/gather_coal/gather_iron need the axe/pickaxe to stay
+    // equipped, and re-equipping the sword here was overwriting that
+    // every single tick, which is why the bot rarely seemed to use its
+    // tools even though resourceManager was equipping them correctly.
+    const isGatheringTask = goal.taskName.startsWith('gather_');
+    if (!isGatheringTask) {
+      await this._autoEquipSword();
     }
 
     // ── Logging ──────────────────────────────────────────────────────────
