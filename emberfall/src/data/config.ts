@@ -33,7 +33,12 @@ export const OFFLINE: OfflineConfigDef = {
 };
 
 export const TIME: TimeConfigDef = {
-  tickIntervalMs: 100,
+  /**
+   * 4 Hz. Production is integrated from elapsed time, so the rate is identical
+   * at any cadence — this only sets how often the UI re-renders and how often
+   * autobuyers get a chance to fire.
+   */
+  tickIntervalMs: 250,
   maxTickMs: 5_000,
   maxBackwardDriftMs: 5_000,
   /** Matches `OFFLINE.minElapsedMs`: longer gaps go through offline catch-up. */

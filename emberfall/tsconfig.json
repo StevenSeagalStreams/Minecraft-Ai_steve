@@ -7,7 +7,7 @@
     "noFallthroughCasesInSwitch": true,
     "exactOptionalPropertyTypes": false,
     "forceConsistentCasingInFileNames": true,
-    "types": ["jest"],
+    "types": ["jest", "node"],
     "paths": {
       "@/*": ["./src/*"]
     }
