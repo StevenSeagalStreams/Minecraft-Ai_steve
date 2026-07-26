@@ -1,0 +1,20 @@
+{
+  "expo": {
+    "name": "Emberfall",
+    "slug": "emberfall",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "dark",
+    "newArchEnabled": true,
+    "scheme": "emberfall",
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.emberfall.game"
+    },
+    "android": {
+      "package": "com.emberfall.game",
+      "edgeToEdgeEnabled": true
+    },
+    "plugins": ["expo-font"]
+  }
+}
