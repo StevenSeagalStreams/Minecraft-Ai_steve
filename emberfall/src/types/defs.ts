@@ -92,9 +92,10 @@ export interface StoryNode {
   readonly body: string;
   /** `null` means the node is only reachable as another node's `nextNode`. */
   readonly trigger: ConditionDef | null;
-  /** Shown at most once per save. */
-  readonly once: boolean;
-  /** When `once` is true, ascension still makes the node eligible again. */
+  /**
+   * Every node is shown at most once per run. When this is true, ascension
+   * clears it from the seen list so the beat can play again in the next run.
+   */
   readonly repeatAfterPrestige: boolean;
   readonly choices: readonly StoryChoice[];
 }

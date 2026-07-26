@@ -78,7 +78,7 @@ export const UPGRADES: readonly UpgradeDef[] = [
     effects: [
       { kind: 'resourceProductionMultiplier', resource: RESOURCE_IDS.ember, factor: '1.25' },
     ],
-    unlock: { kind: 'lifetimeResourceAtLeast', resource: RESOURCE_IDS.ember, amount: '5e4' },
+    unlock: { kind: 'runResourceAtLeast', resource: RESOURCE_IDS.ember, amount: '5e4' },
     requires: [],
     persistent: false,
   },
@@ -92,7 +92,7 @@ export const UPGRADES: readonly UpgradeDef[] = [
     effects: [
       { kind: 'resourceProductionMultiplier', resource: RESOURCE_IDS.lumen, factor: '2' },
     ],
-    unlock: { kind: 'lifetimeResourceAtLeast', resource: RESOURCE_IDS.lumen, amount: '10' },
+    unlock: { kind: 'runResourceAtLeast', resource: RESOURCE_IDS.lumen, amount: '10' },
     requires: [],
     persistent: false,
   },

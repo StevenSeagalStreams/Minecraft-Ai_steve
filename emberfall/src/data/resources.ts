@@ -28,7 +28,7 @@ export const RESOURCES: readonly ResourceDef[] = [
     persistent: false,
     unlockedAtStart: false,
     unlock: {
-      kind: 'lifetimeResourceAtLeast',
+      kind: 'runResourceAtLeast',
       resource: RESOURCE_IDS.ember,
       amount: '1e6',
     },

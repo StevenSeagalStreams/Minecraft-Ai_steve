@@ -36,7 +36,7 @@ export const GENERATORS: readonly GeneratorDef[] = [
     produces: RESOURCE_IDS.ember,
     baseRate: '1',
     cost: { kind: 'exponential', resource: RESOURCE_IDS.ember, base: '120', growth: '1.14' },
-    unlock: { kind: 'lifetimeResourceAtLeast', resource: RESOURCE_IDS.ember, amount: '60' },
+    unlock: { kind: 'runResourceAtLeast', resource: RESOURCE_IDS.ember, amount: '60' },
     unlockedAtStart: false,
   },
   {
@@ -47,7 +47,7 @@ export const GENERATORS: readonly GeneratorDef[] = [
     produces: RESOURCE_IDS.ember,
     baseRate: '12',
     cost: { kind: 'exponential', resource: RESOURCE_IDS.ember, base: '1.5e3', growth: '1.16' },
-    unlock: { kind: 'lifetimeResourceAtLeast', resource: RESOURCE_IDS.ember, amount: '900' },
+    unlock: { kind: 'runResourceAtLeast', resource: RESOURCE_IDS.ember, amount: '900' },
     unlockedAtStart: false,
   },
   {
@@ -58,7 +58,7 @@ export const GENERATORS: readonly GeneratorDef[] = [
     produces: RESOURCE_IDS.ember,
     baseRate: '150',
     cost: { kind: 'exponential', resource: RESOURCE_IDS.ember, base: '2e4', growth: '1.18' },
-    unlock: { kind: 'lifetimeResourceAtLeast', resource: RESOURCE_IDS.ember, amount: '1.2e4' },
+    unlock: { kind: 'runResourceAtLeast', resource: RESOURCE_IDS.ember, amount: '1.2e4' },
     unlockedAtStart: false,
   },
   {
@@ -69,7 +69,7 @@ export const GENERATORS: readonly GeneratorDef[] = [
     produces: RESOURCE_IDS.ember,
     baseRate: '2e3',
     cost: { kind: 'exponential', resource: RESOURCE_IDS.ember, base: '3.5e5', growth: '1.2' },
-    unlock: { kind: 'lifetimeResourceAtLeast', resource: RESOURCE_IDS.ember, amount: '2e5' },
+    unlock: { kind: 'runResourceAtLeast', resource: RESOURCE_IDS.ember, amount: '2e5' },
     unlockedAtStart: false,
   },
   {
@@ -80,7 +80,7 @@ export const GENERATORS: readonly GeneratorDef[] = [
     produces: RESOURCE_IDS.lumen,
     baseRate: '0.05',
     cost: { kind: 'exponential', resource: RESOURCE_IDS.ember, base: '1e7', growth: '1.25' },
-    unlock: { kind: 'lifetimeResourceAtLeast', resource: RESOURCE_IDS.ember, amount: '1e6' },
+    unlock: { kind: 'runResourceAtLeast', resource: RESOURCE_IDS.ember, amount: '1e6' },
     unlockedAtStart: false,
   },
   {
@@ -91,7 +91,7 @@ export const GENERATORS: readonly GeneratorDef[] = [
     produces: RESOURCE_IDS.lumen,
     baseRate: '2',
     cost: { kind: 'exponential', resource: RESOURCE_IDS.lumen, base: '250', growth: '1.3' },
-    unlock: { kind: 'lifetimeResourceAtLeast', resource: RESOURCE_IDS.lumen, amount: '100' },
+    unlock: { kind: 'runResourceAtLeast', resource: RESOURCE_IDS.lumen, amount: '100' },
     unlockedAtStart: false,
   },
 ];

@@ -32,7 +32,6 @@ export const STORY_NODES: readonly StoryNode[] = [
       'that made everyone stop talking. You are holding the last of it. It is ' +
       'small enough to close your hand around, and warm enough that you do not.',
     trigger: { kind: 'always' },
-    once: true,
     repeatAfterPrestige: false,
     choices: [
       {
@@ -66,7 +65,6 @@ export const STORY_NODES: readonly StoryNode[] = [
       'not come from anywhere. "I am going to ask you a question, and I want you ' +
       'to answer it honestly. Are you keeping the fire, or is the fire keeping you?"',
     trigger: { kind: 'lifetimeResourceAtLeast', resource: RESOURCE_IDS.ember, amount: '100' },
-    once: true,
     repeatAfterPrestige: false,
     choices: [
       {
@@ -100,7 +98,6 @@ export const STORY_NODES: readonly StoryNode[] = [
       'of it is dead," she says, not looking up. "But dead is not the same as ' +
       'gone. Give me a reason and I will work for you."',
     trigger: { kind: 'generatorCountAtLeast', generator: GENERATOR_IDS.ashwright, count: '1' },
-    once: true,
     repeatAfterPrestige: false,
     choices: [
       {
@@ -133,7 +130,6 @@ export const STORY_NODES: readonly StoryNode[] = [
       'is the part nobody likes." The choir does not stop when you approach. ' +
       'They are singing the names of everything that used to be warm.',
     trigger: { kind: 'generatorCountAtLeast', generator: GENERATOR_IDS.cinderChoir, count: '3' },
-    once: true,
     repeatAfterPrestige: false,
     choices: [
       {
@@ -167,7 +163,6 @@ export const STORY_NODES: readonly StoryNode[] = [
       'has held in a century. In exchange, when it goes out — and it will go out ' +
       '— you agree to start again. Knowingly. That is the whole price."',
     trigger: { kind: 'lifetimeResourceAtLeast', resource: RESOURCE_IDS.ember, amount: '1e7' },
-    once: true,
     repeatAfterPrestige: false,
     choices: [
       {
@@ -197,7 +192,6 @@ export const STORY_NODES: readonly StoryNode[] = [
       '"Good." Something enormous relaxes. "You should know that everyone says ' +
       'yes. I ask anyway. It matters that you were asked."',
     trigger: null,
-    once: true,
     repeatAfterPrestige: false,
     choices: [],
   },
@@ -210,7 +204,6 @@ export const STORY_NODES: readonly StoryNode[] = [
       '"Also good," it says, and means it. "You will start again regardless. ' +
       'But you will do it without having promised to, and that is not nothing."',
     trigger: null,
-    once: true,
     repeatAfterPrestige: false,
     choices: [
       {
@@ -232,7 +225,6 @@ export const STORY_NODES: readonly StoryNode[] = [
       '"Heat is a verb," she says, holding up the first thread of lumen. "This ' +
       'is a noun. You can build with a noun."',
     trigger: { kind: 'lifetimeResourceAtLeast', resource: RESOURCE_IDS.lumen, amount: '1' },
-    once: true,
     repeatAfterPrestige: false,
     choices: [],
   },
@@ -246,7 +238,6 @@ export const STORY_NODES: readonly StoryNode[] = [
       'someone their shift is over. "What is left when it ends is not nothing. ' +
       'It is small and it is sharp and it will make the next one faster."',
     trigger: { kind: 'runResourceAtLeast', resource: RESOURCE_IDS.ember, amount: '5e8' },
-    once: true,
     repeatAfterPrestige: false,
     choices: [
       {
@@ -269,7 +260,6 @@ export const STORY_NODES: readonly StoryNode[] = [
       'is something small and sharp that was not there the first time. You know ' +
       'where the coals are now. That turns out to be most of it.',
     trigger: { kind: 'prestigeCountAtLeast', count: 1 },
-    once: true,
     repeatAfterPrestige: false,
     choices: [],
   },

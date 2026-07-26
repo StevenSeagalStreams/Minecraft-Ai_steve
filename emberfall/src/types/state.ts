@@ -30,9 +30,13 @@ export interface UpgradeState {
   readonly unlocked: boolean;
 }
 
+/**
+ * The current shard balance is *not* stored here — it lives in `resources`
+ * under `config.prestige.currency`, so there is exactly one source of truth.
+ * Use `getShards(state, config)` to read it.
+ */
 export interface PrestigeState {
   readonly count: number;
-  readonly shards: Decimal;
   readonly lifetimeShards: Decimal;
   /** Best single-run source-resource total, for UI and achievements. */
   readonly bestRunTotal: Decimal;

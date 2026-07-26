@@ -27,7 +27,6 @@ export interface SerializedUpgradeState {
 
 export interface SerializedPrestigeState {
   readonly count: number;
-  readonly shards: DecimalString;
   readonly lifetimeShards: DecimalString;
   readonly bestRunTotal: DecimalString;
   readonly lastAscensionAt: number;
