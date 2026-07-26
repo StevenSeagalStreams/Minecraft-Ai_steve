@@ -13,11 +13,28 @@ export const ZERO: Decimal = new Decimal(0);
 export const ONE: Decimal = new Decimal(1);
 export const TEN: Decimal = new Decimal(10);
 
-/** Canonical coercion. Cheap for values that are already `Decimal`. */
+/**
+ * Parses without throwing. `break_infinity` raises `DecimalError` on strings it
+ * cannot read (`"banana"`) and yields `NaN` for others, so both failure modes
+ * are funnelled into a single `null` result.
+ */
+function tryParse(value: string | number): Decimal | null {
+  try {
+    const decimal = new Decimal(value);
+    return isValid(decimal) ? decimal : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Canonical coercion. Cheap for values that are already `Decimal`, and total:
+ * anything unparseable becomes zero rather than an exception or a `NaN` that
+ * would spread silently through the save.
+ */
 export function D(value: DecimalSource): Decimal {
   if (value instanceof Decimal) return value;
-  const decimal = new Decimal(value);
-  return isValid(decimal) ? decimal : new Decimal(0);
+  return tryParse(value) ?? new Decimal(0);
 }
 
 /** Guards against `NaN`/`Infinity` leaking into saves or the UI. */
@@ -68,8 +85,8 @@ export function serializeDecimal(value: Decimal): string {
 
 export function deserializeDecimal(value: unknown, fallback: DecimalSource = 0): Decimal {
   if (typeof value === 'string' || typeof value === 'number') {
-    const decimal = new Decimal(value);
-    if (isValid(decimal)) return decimal;
+    const decimal = tryParse(value);
+    if (decimal !== null) return decimal;
   }
   return D(fallback);
 }

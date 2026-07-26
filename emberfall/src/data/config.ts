@@ -3,6 +3,7 @@ import type {
   FormattingConfigDef,
   GameConfig,
   OfflineConfigDef,
+  PersistenceConfigDef,
   PrestigeConfigDef,
   TimeConfigDef,
 } from '../types/defs';
@@ -54,6 +55,11 @@ export const BULK_BUY: BulkBuyConfigDef = {
   defaultOption: 1,
 };
 
+export const PERSISTENCE: PersistenceConfigDef = {
+  storageKey: 'emberfall.save.v1',
+  saveIntervalMs: 10_000,
+};
+
 export const GAME_CONFIG: GameConfig = {
   resources: RESOURCES,
   generators: GENERATORS,
@@ -64,4 +70,5 @@ export const GAME_CONFIG: GameConfig = {
   time: TIME,
   formatting: FORMATTING,
   bulkBuy: BULK_BUY,
+  persistence: PERSISTENCE,
 };

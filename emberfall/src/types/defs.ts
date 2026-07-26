@@ -161,6 +161,15 @@ export interface BulkBuyConfigDef {
   readonly defaultOption: number;
 }
 
+export interface PersistenceConfigDef {
+  readonly storageKey: string;
+  /**
+   * Minimum gap between writes. The engine ticks far faster than a save is
+   * worth writing, so writes are throttled and flushed on backgrounding.
+   */
+  readonly saveIntervalMs: number;
+}
+
 export interface GameConfig {
   readonly resources: readonly ResourceDef[];
   readonly generators: readonly GeneratorDef[];
@@ -171,4 +180,5 @@ export interface GameConfig {
   readonly time: TimeConfigDef;
   readonly formatting: FormattingConfigDef;
   readonly bulkBuy: BulkBuyConfigDef;
+  readonly persistence: PersistenceConfigDef;
 }

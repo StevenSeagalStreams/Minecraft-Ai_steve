@@ -205,6 +205,7 @@ export const TEST_CONFIG: GameConfig = {
     groupSeparator: ',',
   },
   bulkBuy: { options: [1, 10, 100, -1], maxOption: -1, defaultOption: 1 },
+  persistence: { storageKey: 'emberfall.test.save', saveIntervalMs: 10_000 },
 };
 
 export const TEST_EPOCH = 1_700_000_000_000;
