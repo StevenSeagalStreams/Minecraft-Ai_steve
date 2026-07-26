@@ -1,8 +1,8 @@
 import type { ReactNode } from 'react';
 import { ScrollView, StyleSheet, Text, View } from 'react-native';
 import { colors, radius, spacing, typography } from '../components/theme';
-import { getRegistry } from '../features/registry';
-import { gameConfig, useGameStore } from '../store/gameStore';
+import { useGameStore } from '../store/gameStore';
+import { selectStoryLog } from '../store/selectors';
 
 /**
  * A record of what has already happened, including which way each choice went.
@@ -10,33 +10,25 @@ import { gameConfig, useGameStore } from '../store/gameStore';
  */
 export function StoryLogScreen(): ReactNode {
   const game = useGameStore((store) => store.game);
-  const registry = getRegistry(gameConfig);
-
-  const seen = game.story.seenNodes
-    .map((id) => registry.story.get(id))
-    .filter((node): node is NonNullable<typeof node> => node !== undefined);
-
-  const chosenAt = new Map(game.story.history.map((record) => [record.node, record.choice]));
+  const entries = selectStoryLog(game);
 
   return (
     <ScrollView contentContainerStyle={styles.content}>
-      {seen.map((node) => {
-        const choiceId = chosenAt.get(node.id);
-        const choice = node.choices.find((option) => option.id === choiceId);
-        return (
-          <View key={node.id} style={styles.entry}>
-            <Text style={styles.chapter}>Chapter {node.chapter}</Text>
-            <Text style={styles.title}>{node.title}</Text>
-            {node.speaker !== null ? <Text style={styles.speaker}>{node.speaker}</Text> : null}
-            <Text style={styles.body}>{node.body}</Text>
-            {choice !== undefined ? (
-              <Text style={styles.choice}>You chose: {choice.text}</Text>
-            ) : null}
-          </View>
-        );
-      })}
+      {entries.map((entry) => (
+        <View key={entry.node.id} style={styles.entry}>
+          <Text style={styles.chapter}>Chapter {entry.node.chapter}</Text>
+          <Text style={styles.title}>{entry.title}</Text>
+          {entry.node.speaker !== null ? (
+            <Text style={styles.speaker}>{entry.node.speaker}</Text>
+          ) : null}
+          <Text style={styles.body}>{entry.body}</Text>
+          {entry.chosenText !== null ? (
+            <Text style={styles.choice}>You chose: {entry.chosenText}</Text>
+          ) : null}
+        </View>
+      ))}
 
-      {seen.length === 0 ? (
+      {entries.length === 0 ? (
         <Text style={styles.empty}>Nothing has happened yet.</Text>
       ) : null}
     </ScrollView>

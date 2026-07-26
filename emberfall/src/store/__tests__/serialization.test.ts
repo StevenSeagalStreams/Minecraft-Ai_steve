@@ -1,6 +1,6 @@
 import { createInitialState } from '../../features/gameState';
 import { resolveChoice } from '../../features/story/story';
-import { evaluateStoryTriggers } from '../../features/story/triggers';
+import { applyStoryTriggers } from '../../features/story/triggers';
 import { applyUnlocks } from '../../features/unlocks';
 import { D, Decimal } from '../../math/decimal';
 import {
@@ -27,7 +27,7 @@ function populatedState() {
     'boost',
     3,
   );
-  const queued = evaluateStoryTriggers(applyUnlocks(base, config), config);
+  const queued = applyStoryTriggers(applyUnlocks(base, config), config).state;
   return resolveChoice(queued, config, 'takeGold', TEST_EPOCH);
 }
 

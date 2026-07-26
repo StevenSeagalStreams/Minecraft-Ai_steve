@@ -17,7 +17,7 @@ React Native + Expo (managed) · TypeScript strict · Zustand + `persist` ·
 npm install
 npx expo start     # run the app
 npx tsc --noEmit   # typecheck
-npm test           # 175 Jest tests
+npm test           # 214 Jest tests
 ```
 
 ## Architecture
@@ -56,6 +56,12 @@ The same test file enforces that too.
 triggers are typed config objects in `src/data/`. Logic files contain no magic
 numbers: gates are `ConditionDef` values and bonuses are `EffectDef` values,
 both interpreted by a single evaluator.
+
+**Story text is templated.** Node and choice text runs through `interpolate`,
+which resolves `{rebirthCount}`, `{resource:id}`, `{lifetime:id}`, `{run:id}`,
+`{owned:generatorId}` and `{shards}` against live state — so a beat that
+repeats after ascension reads differently each run. Unknown tokens are left
+visible rather than blanked, making an authoring typo obvious.
 
 **Every big number is a `Decimal`.** Resources, costs, rates and generator
 counts are `break_infinity.js` values. Raw `number` is reserved for UI-only
@@ -101,17 +107,23 @@ survive ascension, which would leave every later run instantly unlocked —
 
 ### Offline progress
 
-Time away is simulated in fixed steps rather than integrated in one jump, so
-autobuyers compound while away exactly as they would online, scaled by the
-offline efficiency. It is capped, and the UI reports what the cap discarded
-instead of quietly rounding it away.
+`calculateOfflineProgress(state, elapsedMs, config)` simulates time away in
+fixed steps rather than integrating it in one jump, so autobuyers compound
+while away exactly as they would online, scaled by the offline efficiency
+(default 50%). It is capped at 8 hours, and the UI reports what the cap
+discarded instead of quietly rounding it away.
+
+Gaps beyond 5 seconds are routed to the offline path rather than becoming one
+giant tick. The drift threshold and the offline minimum are independent config
+values, so `advance` falls back to a normal tick when offline declines a gap —
+they can be tuned apart without opening a window where elapsed time vanishes.
 
 A backward-moving clock awards nothing and simply resynchronises, so winding
 the device clock back and forth cannot be farmed.
 
 ## Tests
 
-175 Jest tests, concentrated on the risky parts: Decimal precision and
+214 Jest tests, concentrated on the risky parts: Decimal precision and
 serialization, number formatting, cost-curve inversion (`bulkCost` and
 `maxAffordable` are checked as exact inverses), tick determinism, offline
 catch-up, prestige, save migration, and the architecture rules above.

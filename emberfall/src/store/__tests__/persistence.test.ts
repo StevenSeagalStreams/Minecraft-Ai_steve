@@ -57,8 +57,25 @@ describe('migrateSave', () => {
     expect(migrateSave({}, Number.NaN, registry, 3).incomplete).toBe(true);
   });
 
+  it('migrates v0 (empty or corrupt) to a v1 payload', () => {
+    // v0 means "no usable schema". It resolves to an empty payload, which
+    // `deserializeGameState` turns into exactly the fresh default state.
+    for (const junk of [null, 'a string', 42, [], undefined]) {
+      expect(migrateSave(junk, 0).state).toEqual({});
+    }
+    expect(migrateSave({}, 0).incomplete).toBe(false);
+    expect(migrateSave({}, 0).toVersion).toBe(CURRENT_SAVE_VERSION);
+  });
+
+  it('carries a salvageable v0 payload forward rather than discarding it', () => {
+    const salvageable = { resources: { gold: { amount: '500' } } };
+    const result = migrateSave(salvageable, 0);
+    expect(result.state).toEqual(salvageable);
+    expect(result.steps).toBe(1);
+  });
+
   it('has a registry covering every version below the current one', () => {
-    for (let version = 1; version < CURRENT_SAVE_VERSION; version += 1) {
+    for (let version = 0; version < CURRENT_SAVE_VERSION; version += 1) {
       expect(MIGRATIONS[version]).toBeDefined();
     }
     expect(migrateSave({ a: 1 }, CURRENT_SAVE_VERSION).incomplete).toBe(false);
@@ -134,8 +151,17 @@ describe('loadSave', () => {
   });
 
   it('falls back to a new game when a migration path is missing', () => {
+    // Same v0 save as below, but handed a registry with no v0 entry.
     const old = JSON.stringify({ version: 0, savedAt: TEST_EPOCH, state: {} });
     expect(loadSave(old, config, TEST_EPOCH, {}).outcome).toBe('corrupt');
+  });
+
+  it('loads a v0 save as a fresh game through the real migration registry', () => {
+    const v0 = JSON.stringify({ version: 0, savedAt: TEST_EPOCH, state: 'garbage' });
+    const result = loadSave(v0, config, TEST_EPOCH);
+    expect(result.outcome).toBe('migrated');
+    expect(result.fromVersion).toBe(0);
+    expect(snapshot(result.state)).toBe(snapshot(freshState()));
   });
 
   it('never throws, whatever it is handed', () => {

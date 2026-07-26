@@ -17,18 +17,17 @@ export function isEligible(state: GameState, node: StoryNode, config: GameConfig
 }
 
 /**
- * Config order is the tie-break when several nodes fire in the same tick, so
- * the narrative always arrives in authored order.
+ * Newly unlocked story nodes for this state — the pure predicate half of the
+ * story system, called once per tick.
+ *
+ * Config order is the tie-break when several nodes fire at once, so the
+ * narrative always arrives in authored order.
  */
-export function collectTriggeredNodes(
+export function evaluateStoryTriggers(
   state: GameState,
   config: GameConfig,
-): readonly StoryNodeId[] {
-  const triggered: StoryNodeId[] = [];
-  for (const node of config.story) {
-    if (isEligible(state, node, config)) triggered.push(node.id);
-  }
-  return triggered;
+): readonly StoryNode[] {
+  return config.story.filter((node) => isEligible(state, node, config));
 }
 
 /** Appends nodes to the queue, promoting the first one if nothing is active. */
@@ -44,7 +43,17 @@ export function enqueueNodes(state: GameState, nodes: readonly StoryNodeId[]): G
   };
 }
 
-/** Queues everything that has become eligible. Called once per engine tick. */
-export function evaluateStoryTriggers(state: GameState, config: GameConfig): GameState {
-  return enqueueNodes(state, collectTriggeredNodes(state, config));
+/** Evaluates triggers and queues whatever fired. */
+export function applyStoryTriggers(
+  state: GameState,
+  config: GameConfig,
+): { readonly state: GameState; readonly triggered: readonly StoryNode[] } {
+  const triggered = evaluateStoryTriggers(state, config);
+  return {
+    state: enqueueNodes(
+      state,
+      triggered.map((node) => node.id),
+    ),
+    triggered,
+  };
 }

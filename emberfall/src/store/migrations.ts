@@ -18,10 +18,25 @@ export type MigrationFn = (state: unknown) => unknown;
 /** Keyed by source version: `MIGRATIONS[n]` upgrades a v`n` save to v`n+1`. */
 export type MigrationRegistry = Readonly<Record<number, MigrationFn>>;
 
+/**
+ * Version 0 is the "no usable schema" case: a save written before versioning
+ * existed, one whose `version` field is missing or not a number, or one whose
+ * payload is not an object at all.
+ *
+ * It migrates to an empty v1 payload rather than an attempt at recovery.
+ * `deserializeGameState` layers a save over a state built from the current
+ * config, so an empty payload resolves to exactly the fresh default state —
+ * which keeps the "start over" path inside the normal load flow instead of
+ * being a special case bolted onto it.
+ */
+const migrateV0ToV1: MigrationFn = (state) => {
+  if (typeof state !== 'object' || state === null || Array.isArray(state)) return {};
+  return state;
+};
+
 export const MIGRATIONS: MigrationRegistry = {
-  // v1 is the first published schema, so there is nothing to migrate yet.
-  // Example of what an entry looks like:
-  //
+  0: migrateV0ToV1,
+  // Later entries look like:
   //   1: (state) => ({ ...(state as object), newField: 0 }),
 };
 

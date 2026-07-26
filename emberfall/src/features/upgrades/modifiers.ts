@@ -1,4 +1,4 @@
-import { D, type Decimal, ONE } from '../../math/decimal';
+import { D, type Decimal, ONE, ZERO } from '../../math/decimal';
 import { bonusMultiplier, repeatedFactor } from '../../math/scaling';
 import type { GameConfig, GeneratorDef } from '../../types/defs';
 import type { EffectDef } from '../../types/effects';
@@ -15,6 +15,8 @@ import { getShards } from '../resources';
 export interface Modifiers {
   readonly globalProduction: Decimal;
   readonly productionByResource: ReadonlyMap<ResourceId, Decimal>;
+  /** Flat units/second, added after generator totals rather than scaling them. */
+  readonly additiveByResource: ReadonlyMap<ResourceId, Decimal>;
   readonly productionByGenerator: ReadonlyMap<GeneratorId, Decimal>;
   readonly productionByTier: ReadonlyMap<number, Decimal>;
   readonly globalCost: Decimal;
@@ -27,6 +29,7 @@ export interface Modifiers {
 interface MutableModifiers {
   globalProduction: Decimal;
   productionByResource: Map<ResourceId, Decimal>;
+  additiveByResource: Map<ResourceId, Decimal>;
   productionByGenerator: Map<GeneratorId, Decimal>;
   productionByTier: Map<number, Decimal>;
   globalCost: Decimal;
@@ -40,6 +43,7 @@ function emptyModifiers(): MutableModifiers {
   return {
     globalProduction: ONE,
     productionByResource: new Map(),
+    additiveByResource: new Map(),
     productionByGenerator: new Map(),
     productionByTier: new Map(),
     globalCost: ONE,
@@ -71,6 +75,13 @@ function accumulate(target: MutableModifiers, effect: EffectDef, level: number):
         target.productionByResource,
         effect.resource,
         repeatedFactor(D(effect.factor), level),
+      );
+      return;
+    case 'resourceProductionAdditive':
+      // Additive effects scale linearly with level, not exponentially.
+      target.additiveByResource.set(
+        effect.resource,
+        (target.additiveByResource.get(effect.resource) ?? ZERO).add(D(effect.amount).mul(level)),
       );
       return;
     case 'generatorProductionMultiplier':

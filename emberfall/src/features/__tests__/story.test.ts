@@ -1,34 +1,42 @@
 import { amountOf, freshState, modifiersOf, withGenerator, withResource } from '../../testing/helpers';
 import { TEST_CONFIG, TEST_EPOCH } from '../../testing/testConfig';
 import { availableChoices, dismissActiveNode, getActiveNode, resolveChoice } from '../story/story';
-import { collectTriggeredNodes, enqueueNodes, evaluateStoryTriggers } from '../story/triggers';
+import {
+  applyStoryTriggers,
+  enqueueNodes,
+  evaluateStoryTriggers,
+} from '../story/triggers';
 
 const config = TEST_CONFIG;
+
+/** Ids of the nodes that would fire right now. */
+const triggeredIds = (state: Parameters<typeof evaluateStoryTriggers>[0]): string[] =>
+  evaluateStoryTriggers(state, config).map((node) => node.id);
 
 describe('story triggers', () => {
   it('queues nodes whose condition holds, in authored order', () => {
     const state = withGenerator(withResource(freshState(), 'gold', '1000'), 'g1', 5);
-    expect(collectTriggeredNodes(state, config)).toEqual(['intro', 'milestone', 'everyRun']);
+    expect(triggeredIds(state)).toEqual(['intro', 'milestone', 'everyRun']);
   });
 
   it('promotes the first queued node and keeps the rest waiting', () => {
-    const state = evaluateStoryTriggers(withResource(freshState(), 'gold', '1000'), config);
+    const state = applyStoryTriggers(withResource(freshState(), 'gold', '1000'), config).state;
     expect(state.story.activeNode).toBe('intro');
     expect(state.story.queue).toEqual(['milestone']);
   });
 
   it('never queues a node without a trigger', () => {
-    expect(collectTriggeredNodes(freshState(), config)).not.toContain('branch');
+    expect(triggeredIds(freshState())).not.toContain('branch');
   });
 
   it('does not re-queue an active, queued, or already-seen node', () => {
-    const first = evaluateStoryTriggers(freshState(), config);
-    const second = evaluateStoryTriggers(first, config);
+    const first = applyStoryTriggers(freshState(), config).state;
+    const second = applyStoryTriggers(first, config).state;
     expect(second.story.queue).toEqual(first.story.queue);
     expect(second.story.activeNode).toBe('intro');
 
     const dismissed = dismissActiveNode(first);
-    expect(collectTriggeredNodes(dismissed, config)).not.toContain('intro');
+    expect(triggeredIds(dismissed)).not.toContain('intro');
   });
 
   it('ignores an empty enqueue', () => {
@@ -38,7 +46,7 @@ describe('story triggers', () => {
 });
 
 describe('resolveChoice', () => {
-  const queued = evaluateStoryTriggers(freshState(), config);
+  const queued = applyStoryTriggers(freshState(), config).state;
 
   it('applies immediate effects', () => {
     const next = resolveChoice(queued, config, 'takeGold', TEST_EPOCH);
@@ -97,20 +105,20 @@ describe('resolveChoice', () => {
           : node,
       ),
     };
-    const state = evaluateStoryTriggers(freshState(gated), gated);
+    const state = applyStoryTriggers(freshState(gated), gated).state;
     expect(resolveChoice(state, gated, 'takeGold', TEST_EPOCH)).toBe(state);
   });
 });
 
 describe('active node helpers', () => {
   it('resolves the active node definition', () => {
-    const state = evaluateStoryTriggers(freshState(), config);
+    const state = applyStoryTriggers(freshState(), config).state;
     expect(getActiveNode(state, config)?.title).toBe('Intro');
     expect(getActiveNode(freshState(), config)).toBeNull();
   });
 
   it('lists only choices whose requirement holds', () => {
-    const state = evaluateStoryTriggers(freshState(), config);
+    const state = applyStoryTriggers(freshState(), config).state;
     const node = getActiveNode(state, config);
     expect(node).not.toBeNull();
     if (node !== null) {
@@ -119,7 +127,7 @@ describe('active node helpers', () => {
   });
 
   it('dismissing a node grants nothing but advances the queue', () => {
-    const state = enqueueNodes(evaluateStoryTriggers(freshState(), config), ['milestone']);
+    const state = enqueueNodes(applyStoryTriggers(freshState(), config).state, ['milestone']);
     const next = dismissActiveNode(state);
     expect(amountOf(next, 'gold').eq(0)).toBe(true);
     expect(next.story.seenNodes).toContain('intro');

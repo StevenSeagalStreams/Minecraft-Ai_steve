@@ -57,3 +57,33 @@ describe('advance', () => {
     expect(result.state.lastTickAt).toBe(TEST_EPOCH + 10);
   });
 });
+
+describe('advance — gaps between the drift threshold and the offline minimum', () => {
+  /**
+   * The drift threshold and the offline minimum are independent config values.
+   * When they are tuned apart, a gap can be long enough to be routed to offline
+   * but too short for offline to accept it. That window must still be credited.
+   */
+  const split = {
+    ...config,
+    time: { ...config.time, maxForwardDriftMs: 1_000 },
+    offline: { ...config.offline, minElapsedMs: 60_000 },
+  };
+
+  it('falls back to a tick instead of dropping the elapsed time', () => {
+    const state = withGenerator(freshState(split), 'g1', 2);
+    const result = advance(state, TEST_EPOCH + 3_000, split);
+
+    expect(result.drift.kind).toBe('forwardJump');
+    expect(result.offline?.applied).toBe(false);
+    expect(result.tick).not.toBeNull();
+    // 2/s for 3s at full efficiency — credited as a tick, not silently lost.
+    expect(amountOf(result.state, 'gold').eq(6)).toBe(true);
+  });
+
+  it('still advances the clock in the fallback path', () => {
+    const state = withGenerator(freshState(split), 'g1', 2);
+    const result = advance(state, TEST_EPOCH + 3_000, split);
+    expect(result.state.lastTickAt).toBe(TEST_EPOCH + 3_000);
+  });
+});

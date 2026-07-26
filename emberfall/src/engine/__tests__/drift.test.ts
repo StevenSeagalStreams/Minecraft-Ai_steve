@@ -13,17 +13,24 @@ describe('assessTimeDrift', () => {
   });
 
   it('clamps a long-but-online gap to maxTickMs', () => {
-    const drift = assessTimeDrift(TEST_EPOCH, TEST_EPOCH + 20_000, time);
+    // Needs a config where a gap can exceed maxTickMs while staying online;
+    // the shipping config sets both thresholds to the same value.
+    const laggy = { ...time, maxTickMs: 2_000, maxForwardDriftMs: 30_000 };
+    const drift = assessTimeDrift(TEST_EPOCH, TEST_EPOCH + 20_000, laggy);
     expect(drift.kind).toBe('normal');
-    expect(drift.tickMs).toBe(time.maxTickMs);
+    expect(drift.tickMs).toBe(2_000);
     expect(drift.rawElapsedMs).toBe(20_000);
   });
 
-  it('routes a large forward jump to offline progress', () => {
+  it('routes any gap past the threshold to offline progress', () => {
     const drift = assessTimeDrift(TEST_EPOCH, TEST_EPOCH + 7_200_000, time);
     expect(drift.kind).toBe('forwardJump');
     expect(drift.tickMs).toBe(0);
     expect(drift.offlineMs).toBe(7_200_000);
+
+    const small = assessTimeDrift(TEST_EPOCH, TEST_EPOCH + time.maxForwardDriftMs + 1, time);
+    expect(small.kind).toBe('forwardJump');
+    expect(small.offlineMs).toBe(time.maxForwardDriftMs + 1);
   });
 
   it('awards nothing when the clock moves backwards', () => {

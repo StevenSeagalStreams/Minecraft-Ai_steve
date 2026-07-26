@@ -9,7 +9,7 @@ import {
 } from '../../testing/helpers';
 import { TEST_CONFIG, TEST_EPOCH } from '../../testing/testConfig';
 import { resolveChoice } from '../story/story';
-import { evaluateStoryTriggers } from '../story/triggers';
+import { applyStoryTriggers } from '../story/triggers';
 import { ascend, ascensionProgress, canAscend, computeShardGain } from '../prestige/prestige';
 
 const config = TEST_CONFIG;
@@ -39,7 +39,7 @@ describe('computeShardGain', () => {
 
   it('scales with prestige-gain modifiers', () => {
     const base = runWith('1e6');
-    const boosted = evaluateStoryTriggers(base, config);
+    const boosted = applyStoryTriggers(base, config).state;
     const withChoice = resolveChoice(boosted, config, 'takePower', TEST_EPOCH);
     // The story choice grants production, not prestige gain, so the reward is
     // unchanged — the modifier plumbing must not leak between channels.
@@ -137,7 +137,7 @@ describe('ascend', () => {
   });
 
   it('preserves story flags and choice history across the reset', () => {
-    const queued = evaluateStoryTriggers(freshState(), config);
+    const queued = applyStoryTriggers(freshState(), config).state;
     const chosen = resolveChoice(queued, config, 'takeGold', TEST_EPOCH);
     const state = withResource(chosen, 'gold', '1e6');
 

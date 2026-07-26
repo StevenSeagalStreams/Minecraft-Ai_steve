@@ -29,6 +29,14 @@ export function productionPerSecond(
     if (rate.lte(ZERO)) continue;
     totals.set(def.produces, (totals.get(def.produces) ?? ZERO).add(rate));
   }
+
+  // Flat bonuses land after the generator sums, so they are a floor on output
+  // rather than something the generator multipliers amplify.
+  for (const [resource, flat] of modifiers.additiveByResource) {
+    if (state.resources[resource] === undefined || flat.lte(ZERO)) continue;
+    totals.set(resource, (totals.get(resource) ?? ZERO).add(flat));
+  }
+
   return totals;
 }
 
@@ -42,12 +50,43 @@ export function resourceRate(
 }
 
 /**
- * Credits `seconds` worth of production.
+ * What `seconds` of production is worth, without applying it.
  *
  * `scale` is the offline-efficiency factor (1 while the app is in front of the
  * player). Production is integrated as `rate * seconds` against a snapshot of
  * the state, so ordering between generators can never affect the result.
  */
+export function computeGains(
+  state: GameState,
+  seconds: number,
+  config: GameConfig,
+  modifiers: Modifiers,
+  scale: Decimal = ONE,
+): ReadonlyMap<ResourceId, Decimal> {
+  if (!Number.isFinite(seconds) || seconds <= 0) return new Map();
+  const elapsed = D(seconds).mul(scale);
+  if (elapsed.lte(ZERO)) return new Map();
+
+  const gains = new Map<ResourceId, Decimal>();
+  for (const [resource, rate] of productionPerSecond(state, config, modifiers)) {
+    const gain = rate.mul(elapsed);
+    if (gain.gt(ZERO)) gains.set(resource, gain);
+  }
+  return gains;
+}
+
+export function applyGains(
+  state: GameState,
+  gains: ReadonlyMap<ResourceId, Decimal>,
+): GameState {
+  let next = state;
+  for (const [resource, gain] of gains) {
+    next = addResource(next, resource, gain);
+  }
+  return next;
+}
+
+/** Convenience composition of `computeGains` + `applyGains`. */
 export function produce(
   state: GameState,
   seconds: number,
@@ -55,15 +94,18 @@ export function produce(
   modifiers: Modifiers,
   scale: Decimal = ONE,
 ): GameState {
-  if (!Number.isFinite(seconds) || seconds <= 0) return state;
-  const elapsed = D(seconds).mul(scale);
-  if (elapsed.lte(ZERO)) return state;
+  return applyGains(state, computeGains(state, seconds, config, modifiers, scale));
+}
 
-  let next = state;
-  for (const [resource, rate] of productionPerSecond(state, config, modifiers)) {
-    next = addResource(next, resource, rate.mul(elapsed));
+/** Merges per-step gain maps, for summarising a multi-step catch-up. */
+export function mergeGains(
+  into: Map<ResourceId, Decimal>,
+  from: ReadonlyMap<ResourceId, Decimal>,
+): Map<ResourceId, Decimal> {
+  for (const [resource, gain] of from) {
+    into.set(resource, (into.get(resource) ?? ZERO).add(gain));
   }
-  return next;
+  return into;
 }
 
 /** Per-generator rates, for the UI's contribution breakdown. */

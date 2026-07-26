@@ -19,6 +19,12 @@ export type EffectDef =
       readonly resource: ResourceId;
       readonly factor: DecimalString;
     }
+  /** Flat units/second added to a resource, applied after generator totals. */
+  | {
+      readonly kind: 'resourceProductionAdditive';
+      readonly resource: ResourceId;
+      readonly amount: DecimalString;
+    }
   | {
       readonly kind: 'generatorProductionMultiplier';
       readonly generator: GeneratorId;

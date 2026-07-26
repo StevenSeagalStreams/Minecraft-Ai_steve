@@ -1,6 +1,9 @@
 import { GAME_CONFIG } from '../data/config';
+import { gatherAmount } from '../features/idle/gather';
 import { nextUnitCost, quotePurchase } from '../features/idle/generators';
 import { generatorRate, productionPerSecond } from '../features/idle/production';
+import { getRegistry } from '../features/registry';
+import { interpolate } from '../features/story/template';
 import { ascensionProgress, canAscend, computeShardGain } from '../features/prestige/prestige';
 import { availableChoices, getActiveNode } from '../features/story/story';
 import { getShards } from '../features/resources';
@@ -132,10 +135,32 @@ export function selectPrestige(
   };
 }
 
+export interface StoryChoiceView {
+  readonly id: string;
+  readonly text: string;
+  readonly flavour: string | null;
+}
+
 export interface StoryView {
   readonly node: StoryNode;
-  readonly choices: readonly StoryChoice[];
+  /** Templates resolved against the current state, so text varies per rebirth. */
+  readonly title: string;
+  readonly body: string;
+  readonly speaker: string | null;
+  readonly choices: readonly StoryChoiceView[];
   readonly queued: number;
+}
+
+function toChoiceView(
+  choice: StoryChoice,
+  state: GameState,
+  config: GameConfig,
+): StoryChoiceView {
+  return {
+    id: choice.id,
+    text: interpolate(choice.text, state, config),
+    flavour: choice.flavour === null ? null : interpolate(choice.flavour, state, config),
+  };
 }
 
 export function selectActiveStory(
@@ -146,9 +171,49 @@ export function selectActiveStory(
   if (node === null) return null;
   return {
     node,
-    choices: availableChoices(state, node, config),
+    title: interpolate(node.title, state, config),
+    body: interpolate(node.body, state, config),
+    speaker: node.speaker,
+    choices: availableChoices(state, node, config).map((choice) =>
+      toChoiceView(choice, state, config),
+    ),
     queued: state.story.queue.length,
   };
+}
+
+export interface StoryLogEntry {
+  readonly node: StoryNode;
+  readonly title: string;
+  readonly body: string;
+  /** The choice taken, already interpolated; `null` if the node had none. */
+  readonly chosenText: string | null;
+}
+
+/**
+ * The story so far. Templates are resolved against *present* state, so a
+ * recorded beat reads as it would if it happened now — the log is a retelling,
+ * not a transcript.
+ */
+export function selectStoryLog(
+  state: GameState,
+  config: GameConfig = GAME_CONFIG,
+): readonly StoryLogEntry[] {
+  const registry = getRegistry(config);
+  const chosen = new Map(state.story.history.map((record) => [record.node, record.choice]));
+
+  return state.story.seenNodes.flatMap((id) => {
+    const node = registry.story.get(id);
+    if (node === undefined) return [];
+    const choice = node.choices.find((option) => option.id === chosen.get(id));
+    return [
+      {
+        node,
+        title: interpolate(node.title, state, config),
+        body: interpolate(node.body, state, config),
+        chosenText: choice === undefined ? null : interpolate(choice.text, state, config),
+      },
+    ];
+  });
 }
 
 export function selectModifiers(
@@ -156,4 +221,13 @@ export function selectModifiers(
   config: GameConfig = GAME_CONFIG,
 ): Modifiers {
   return computeModifiers(state, config);
+}
+
+/** What one manual tap is currently worth. */
+export function selectGatherYield(
+  state: GameState,
+  config: GameConfig = GAME_CONFIG,
+  modifiers: Modifiers = computeModifiers(state, config),
+): Decimal {
+  return gatherAmount(state, config, modifiers);
 }

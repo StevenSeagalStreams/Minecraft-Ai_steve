@@ -16,6 +16,7 @@ interface StoryModalProps {
 export function StoryModal({ story, onChoose, onDismiss }: StoryModalProps): ReactNode {
   if (story === null) return null;
   const { node, choices } = story;
+  // Text arrives pre-interpolated from the selector; this component renders it.
 
   return (
     <Modal visible transparent animationType="fade" onRequestClose={onDismiss}>
@@ -23,9 +24,9 @@ export function StoryModal({ story, onChoose, onDismiss }: StoryModalProps): Rea
         <View style={styles.sheet}>
           <ScrollView contentContainerStyle={styles.content}>
             <Text style={styles.chapter}>Chapter {node.chapter}</Text>
-            <Text style={styles.title}>{node.title}</Text>
-            {node.speaker !== null ? <Text style={styles.speaker}>{node.speaker}</Text> : null}
-            <Text style={styles.body}>{node.body}</Text>
+            <Text style={styles.title}>{story.title}</Text>
+            {story.speaker !== null ? <Text style={styles.speaker}>{story.speaker}</Text> : null}
+            <Text style={styles.body}>{story.body}</Text>
 
             <View style={styles.choices}>
               {choices.length > 0 ? (

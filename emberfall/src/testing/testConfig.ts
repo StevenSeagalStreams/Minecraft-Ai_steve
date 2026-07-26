@@ -183,7 +183,7 @@ export const TEST_CONFIG: GameConfig = {
     shardBonusExponent: 1,
   },
   offline: {
-    minElapsedMs: 1_000,
+    minElapsedMs: 5_000,
     maxElapsedMs: 3_600_000,
     efficiency: 0.5,
     stepMs: 1_000,
@@ -194,7 +194,7 @@ export const TEST_CONFIG: GameConfig = {
     tickIntervalMs: 100,
     maxTickMs: 5_000,
     maxBackwardDriftMs: 5_000,
-    maxForwardDriftMs: 30_000,
+    maxForwardDriftMs: 5_000,
   },
   formatting: {
     notation: 'standard',
@@ -205,6 +205,7 @@ export const TEST_CONFIG: GameConfig = {
     groupSeparator: ',',
   },
   bulkBuy: { options: [1, 10, 100, -1], maxOption: -1, defaultOption: 1 },
+  manualGather: { resource: 'gold', baseAmount: '1', secondsOfProduction: 0.5 },
   persistence: { storageKey: 'emberfall.test.save', saveIntervalMs: 10_000 },
 };
 

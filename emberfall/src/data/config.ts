@@ -2,6 +2,7 @@ import type {
   BulkBuyConfigDef,
   FormattingConfigDef,
   GameConfig,
+  ManualGatherConfigDef,
   OfflineConfigDef,
   PersistenceConfigDef,
   PrestigeConfigDef,
@@ -24,8 +25,9 @@ export const PRESTIGE: PrestigeConfigDef = {
 };
 
 export const OFFLINE: OfflineConfigDef = {
-  minElapsedMs: 30_000,
-  maxElapsedMs: 43_200_000,
+  minElapsedMs: 5_000,
+  /** 8 hours. */
+  maxElapsedMs: 28_800_000,
   efficiency: 0.5,
   stepMs: 1_000,
   maxSteps: 2_000,
@@ -41,8 +43,24 @@ export const TIME: TimeConfigDef = {
   tickIntervalMs: 250,
   maxTickMs: 5_000,
   maxBackwardDriftMs: 5_000,
-  /** Matches `OFFLINE.minElapsedMs`: longer gaps go through offline catch-up. */
-  maxForwardDriftMs: 30_000,
+  /**
+   * Gaps beyond 5s are routed through offline catch-up rather than integrated
+   * as one giant tick. `advance` falls back to a tick if the offline path
+   * declines, so this value and `OFFLINE.minElapsedMs` can be tuned apart
+   * without opening a window where elapsed time is dropped.
+   */
+  maxForwardDriftMs: 5_000,
+};
+
+export const MANUAL_GATHER: ManualGatherConfigDef = {
+  resource: RESOURCE_IDS.ember,
+  /** Base yield per tap, before the global production multiplier. */
+  baseAmount: '1',
+  /**
+   * A tap is also worth this many seconds of current output, so tapping stays
+   * marginally relevant early and gracefully becomes irrelevant later.
+   */
+  secondsOfProduction: 0.5,
 };
 
 export const FORMATTING: FormattingConfigDef = {
@@ -75,5 +93,6 @@ export const GAME_CONFIG: GameConfig = {
   time: TIME,
   formatting: FORMATTING,
   bulkBuy: BULK_BUY,
+  manualGather: MANUAL_GATHER,
   persistence: PERSISTENCE,
 };

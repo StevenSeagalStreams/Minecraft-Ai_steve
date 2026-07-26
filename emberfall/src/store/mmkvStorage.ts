@@ -53,6 +53,8 @@ export interface ThrottledStorage extends RawStorage {
   flush(): void;
   /** Drops a pending write without persisting it. */
   cancel(): void;
+  /** Timestamp of the last committed write, or `null` if nothing is saved yet. */
+  lastWriteAt(): number | null;
 }
 
 /**
@@ -96,5 +98,6 @@ export function createThrottledStorage(
     cancel: () => {
       pending = null;
     },
+    lastWriteAt: () => (Number.isFinite(lastWriteAt) ? lastWriteAt : null),
   };
 }

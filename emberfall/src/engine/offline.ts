@@ -1,6 +1,7 @@
-import { D, type Decimal, ZERO } from '../math/decimal';
-import { evaluateStoryTriggers } from '../features/story/triggers';
+import { mergeGains } from '../features/idle/production';
+import { applyStoryTriggers } from '../features/story/triggers';
 import { computeModifiers } from '../features/upgrades/modifiers';
+import { D, type Decimal } from '../math/decimal';
 import type { GameConfig } from '../types/defs';
 import type { ResourceId } from '../types/ids';
 import type { GameState } from '../types/state';
@@ -16,7 +17,7 @@ export interface OfflineResult {
   readonly steps: number;
   readonly efficiency: number;
   readonly gains: ReadonlyMap<ResourceId, Decimal>;
-  /** False when the gap was too short to count as being away. */
+  /** False when the gap was too short, zero, or invalid to count as away time. */
   readonly applied: boolean;
 }
 
@@ -33,19 +34,6 @@ function emptyResult(state: GameState, rawElapsedMs: number, efficiency: number)
   };
 }
 
-function diffResources(
-  before: GameState,
-  after: GameState,
-): ReadonlyMap<ResourceId, Decimal> {
-  const gains = new Map<ResourceId, Decimal>();
-  for (const [id, resource] of Object.entries(after.resources)) {
-    const previous = before.resources[id]?.amount ?? ZERO;
-    const delta = resource.amount.sub(previous);
-    if (delta.gt(ZERO)) gains.set(id, delta);
-  }
-  return gains;
-}
-
 /**
  * Credits time spent away as a fixed-step simulation.
  *
@@ -58,7 +46,7 @@ function diffResources(
  * `time.maxTickMs`, which bounds the loop while keeping every step within the
  * range a normal tick would accept.
  */
-export function computeOfflineProgress(
+export function calculateOfflineProgress(
   state: GameState,
   elapsedMs: number,
   config: GameConfig,
@@ -69,8 +57,10 @@ export function computeOfflineProgress(
     1,
   );
 
+  // Zero, negative, non-finite and too-short gaps all decline identically:
+  // the caller keeps the state it had and handles the remainder as a tick.
   if (!Number.isFinite(elapsedMs) || elapsedMs < config.offline.minElapsedMs) {
-    return emptyResult(state, Math.max(elapsedMs, 0), efficiency);
+    return emptyResult(state, Number.isFinite(elapsedMs) ? Math.max(elapsedMs, 0) : 0, efficiency);
   }
 
   const creditedMs = Math.min(elapsedMs, config.offline.maxElapsedMs);
@@ -80,24 +70,27 @@ export function computeOfflineProgress(
   );
 
   const scale = D(efficiency);
+  const gains = new Map<ResourceId, Decimal>();
   let next = state;
   let remaining = creditedMs;
   let steps = 0;
 
   while (remaining > 0) {
     const delta = Math.min(stepMs, remaining);
-    next = tick(next, delta, config, {
+    const result = tick(next, delta, config, {
       scale,
       automation: config.offline.automationEnabled,
       // Triggers are evaluated once at the end so the player returns to a
       // single ordered queue rather than a burst of mid-simulation beats.
       story: false,
     });
+    next = result.state;
+    mergeGains(gains, result.gains);
     remaining -= delta;
     steps += 1;
   }
 
-  next = evaluateStoryTriggers(next, config);
+  next = applyStoryTriggers(next, config).state;
 
   return {
     state: {
@@ -109,7 +102,7 @@ export function computeOfflineProgress(
     discardedMs: Math.max(elapsedMs - creditedMs, 0),
     steps,
     efficiency,
-    gains: diffResources(state, next),
+    gains,
     applied: true,
   };
 }

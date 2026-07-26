@@ -4,6 +4,7 @@ import { GAME_CONFIG } from '../data/config';
 import { advance } from '../engine/advance';
 import type { OfflineResult } from '../engine/offline';
 import { createInitialState } from '../features/gameState';
+import { manualGather } from '../features/idle/gather';
 import { BUY_MAX, purchaseGenerator, setAutomationEnabled } from '../features/idle/generators';
 import { ascend } from '../features/prestige/prestige';
 import { dismissActiveNode, resolveChoice } from '../features/story/story';
@@ -33,8 +34,13 @@ export interface GameStore {
   readonly pendingOffline: OfflineSummary | null;
   /** UI preference: how many units the buy buttons purchase at once. */
   readonly bulkBuy: number;
+  /** Debug telemetry: milliseconds integrated by the most recent advance. */
+  readonly lastTickDeltaMs: number;
+  /** Debug telemetry: wall-clock stamp of the last committed save, if any. */
+  readonly lastSavedAt: number | null;
 
   advanceTo(now?: number): void;
+  gather(): void;
   buyGenerator(id: GeneratorId, count?: number): void;
   buyUpgrade(id: UpgradeId): void;
   toggleAutomation(id: GeneratorId, enabled: boolean): void;
@@ -111,16 +117,25 @@ export const useGameStore = create<GameStore>()(
       hydrated: false,
       pendingOffline: null,
       bulkBuy: config.bulkBuy.defaultOption,
+      lastTickDeltaMs: 0,
+      lastSavedAt: null,
 
       advanceTo: (now = Date.now()) => {
         const result = advance(get().game, now, config);
         set({
           game: result.state,
+          lastTickDeltaMs: result.tick?.elapsedMs ?? result.offline?.creditedMs ?? 0,
+          lastSavedAt: throttled.lastWriteAt(),
           pendingOffline:
             result.offline !== null && result.offline.applied
               ? toSummary(result.offline)
               : get().pendingOffline,
         });
+      },
+
+      gather: () => {
+        const { game } = get();
+        set({ game: manualGather(game, config, computeModifiers(game, config)).state });
       },
 
       buyGenerator: (id, count) => {

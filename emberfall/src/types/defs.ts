@@ -161,6 +161,13 @@ export interface BulkBuyConfigDef {
   readonly defaultOption: number;
 }
 
+export interface ManualGatherConfigDef {
+  readonly resource: ResourceId;
+  readonly baseAmount: DecimalString;
+  /** Each tap is also worth this many seconds of current production. */
+  readonly secondsOfProduction: number;
+}
+
 export interface PersistenceConfigDef {
   readonly storageKey: string;
   /**
@@ -180,5 +187,6 @@ export interface GameConfig {
   readonly time: TimeConfigDef;
   readonly formatting: FormattingConfigDef;
   readonly bulkBuy: BulkBuyConfigDef;
+  readonly manualGather: ManualGatherConfigDef;
   readonly persistence: PersistenceConfigDef;
 }
