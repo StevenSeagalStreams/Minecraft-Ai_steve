@@ -1,8 +1,0 @@
-node_modules/
-.expo/
-dist/
-web-build/
-coverage/
-*.log
-.DS_Store
-expo-env.d.ts
