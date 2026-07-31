@@ -1,2 +1,5 @@
 node_modules/
+game/node_modules/
+game/dist/
+game/shots/
 *.log
