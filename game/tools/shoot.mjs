@@ -14,7 +14,8 @@ import { chromium } from 'playwright';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { spawn } from 'node:child_process';
-import { existsSync, readdirSync } from 'node:fs';
+import { existsSync, readdirSync, mkdirSync, writeFileSync, readFileSync, statSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import process from 'node:process';
 
 /**
@@ -236,10 +237,81 @@ async function startServer() {
   return child;
 }
 
+/**
+ * Global capture lock.
+ *
+ * Rendering here is SwiftShader -- pure software GL on 4 cores. Several agents
+ * capturing at once does not give you several captures; it gives you N
+ * captures each running at 1/N speed, and past a certain point the page cannot
+ * even finish navigating before Playwright's timeout. Serialising turns that
+ * thrash into a queue: one capture at full speed, then the next.
+ *
+ * The lock is a directory (atomic create on every POSIX filesystem) holding
+ * the owner's pid. A lock whose owner is gone, or which is older than the
+ * staleness window, is reclaimed -- so a killed run never wedges the queue.
+ */
+const LOCK_DIR = join(tmpdir(), 'emberfall-capture.lock');
+const LOCK_STALE_MS = 20 * 60 * 1000;
+
+async function acquireLock(timeoutMs = 45 * 60 * 1000) {
+  const started = Date.now();
+  let announced = false;
+  for (;;) {
+    try {
+      mkdirSync(LOCK_DIR);
+      writeFileSync(join(LOCK_DIR, 'pid'), String(process.pid));
+      return;
+    } catch (err) {
+      if (err.code !== 'EEXIST') throw err;
+    }
+
+    // Reclaim if the holder died or has been holding too long.
+    let stale = false;
+    try {
+      const owner = Number(readFileSync(join(LOCK_DIR, 'pid'), 'utf8').trim());
+      const age = Date.now() - statSync(LOCK_DIR).mtimeMs;
+      if (age > LOCK_STALE_MS) stale = true;
+      else if (owner && owner !== process.pid) {
+        try { process.kill(owner, 0); } catch { stale = true; }
+      }
+    } catch {
+      stale = true; // unreadable lock -- treat as abandoned
+    }
+
+    if (stale) {
+      try { rmSync(LOCK_DIR, { recursive: true, force: true }); } catch { /* raced */ }
+      continue;
+    }
+
+    if (Date.now() - started > timeoutMs) {
+      throw new Error(`could not acquire capture lock within ${Math.round(timeoutMs / 60000)}m`);
+    }
+    if (!announced) {
+      console.log('waiting for the capture lock (another shoot is running)...');
+      announced = true;
+    }
+    await new Promise((r) => setTimeout(r, 3000 + Math.random() * 2000));
+  }
+}
+
+function releaseLock() {
+  try {
+    const owner = Number(readFileSync(join(LOCK_DIR, 'pid'), 'utf8').trim());
+    if (owner === process.pid) rmSync(LOCK_DIR, { recursive: true, force: true });
+  } catch { /* already gone */ }
+}
+
 async function main() {
   const wanted = args.all ? Object.keys(SHOTS) : [args.shot ?? 'wide'];
   for (const name of wanted) {
     if (!SHOTS[name]) throw new Error(`unknown shot "${name}" (have: ${Object.keys(SHOTS).join(', ')})`);
+  }
+
+  if (args.nolock !== true) {
+    await acquireLock();
+    for (const sig of ['exit', 'SIGINT', 'SIGTERM', 'uncaughtException']) {
+      process.once(sig, () => { releaseLock(); if (sig !== 'exit') process.exit(1); });
+    }
   }
 
   const server = await startServer();
@@ -269,7 +341,7 @@ async function main() {
     page.on('pageerror', (e) => logs.push(`[pageerror] ${e.message}`));
 
     const url = `http://127.0.0.1:${PORT}/?seed=${SEED}&quality=${QUALITY}&zone=${ZONE}`;
-    await page.goto(url, { waitUntil: 'domcontentloaded' });
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 180000 });
 
     try {
       await page.waitForFunction(() => window.__ready === true, { timeout: 120000 });
@@ -322,6 +394,7 @@ async function main() {
   } finally {
     await browser.close();
     server.kill('SIGTERM');
+    releaseLock();
   }
 
   console.log('\n' + JSON.stringify(results, null, 2));

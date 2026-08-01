@@ -85,15 +85,22 @@ function buildFungusStemGeometry(rng) {
   return merge(parts);
 }
 
+/** No prop, of any kind, is allowed to spawn within this radius of the
+ * player's start position -- the player must spawn with a clear view of the
+ * landmark, not inside or behind a prop. */
+const SPAWN_CLEAR_RADIUS = 6.5;
+
 function scatterField(rng, terrain, { cellSize, accept }) {
   const worldSize = terrain.worldSize;
   const cells = Math.round(worldSize / cellSize);
+  const entry = terrain.path.entry;
   const out = [];
   for (let j = 0; j < cells; j++) {
     for (let i = 0; i < cells; i++) {
       const wx = (i + 0.5 + rng.range(-0.5, 0.5)) * cellSize;
       const wz = (j + 0.5 + rng.range(-0.5, 0.5)) * cellSize;
       if (wx < 1 || wz < 1 || wx > worldSize - 1 || wz > worldSize - 1) continue;
+      if (Math.hypot(wx - entry.x, wz - entry.z) < SPAWN_CLEAR_RADIUS) continue;
       if (!accept(wx, wz, rng)) continue;
       out.push({ wx, wz });
     }
@@ -168,7 +175,12 @@ export function buildForestDressing({ rng, materials, terrain }) {
   drawCalls += 1;
   counts.bones = boneXf.length;
 
-  // -- reclaimed fence line at the trailhead, near spawn --------------------
+  // -- reclaimed fence line near the trailhead -------------------------------
+  // Offset well clear of spawn (SPAWN_CLEAR_RADIUS is a hard per-instance
+  // guard below) and shifted *behind* the player relative to the path, so it
+  // reads as an old homestead boundary off to one side rather than sitting
+  // in the sightline toward the landmark. Posts are ~1.1-1.5m tall, spaced
+  // 1.8m apart -- small dressing, never meant to fill a close-up frame.
   const fenceMat = pick(materials, 'woodBeams', 'floor').clone();
   fenceMat.color = new THREE.Color(0x4a463c);
   const postGeo = buildFencePostGeometry(rng, false);
@@ -176,21 +188,24 @@ export function buildForestDressing({ rng, materials, terrain }) {
   const entry = terrain.path.entry;
   const fenceDir = new THREE.Vector3().subVectors(terrain.path.hollowPt, entry).normalize();
   const perp = new THREE.Vector3(-fenceDir.z, 0, fenceDir.x);
+  const fenceYaw = Math.atan2(-fenceDir.z, fenceDir.x); // aligns the crossbar with the line
+  const perpDist = 17;
+  const centerAlong = -9; // behind spawn, away from the forward sightline
   const postXf = [], stumpXf = [];
-  const postCount = 11;
+  const postCount = 9;
   for (let i = 0; i < postCount; i++) {
     if (rng.bool(0.22)) continue; // gaps in the fence line
-    const along = (i - postCount / 2) * 1.8;
-    const side = rng.bool(0.5) ? 1 : -1;
-    const wx = entry.x + perp.x * (7 + side * 0.6) + fenceDir.x * along;
-    const wz = entry.z + perp.z * (7 + side * 0.6) + fenceDir.z * along;
+    const along = centerAlong + (i - postCount / 2) * 1.8;
+    const wx = entry.x + perp.x * perpDist + fenceDir.x * along;
+    const wz = entry.z + perp.z * perpDist + fenceDir.z * along;
+    if (Math.hypot(wx - entry.x, wz - entry.z) < SPAWN_CLEAR_RADIUS) continue;
     if (terrain.slopeAt(wx, wz) > 0.3 || terrain.waterAt(wx, wz) > 0.3) continue;
     const broken = rng.bool(0.35);
     const lean = rng.range(0, broken ? 0.5 : 0.18);
     const q = new THREE.Quaternion()
       .multiplyQuaternions(
-        new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), lean * rng.range(-1, 1)),
-        new THREE.Quaternion().setFromAxisAngle(_up, rng.range(0, Math.PI * 2))
+        new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), lean * rng.range(-1, 1)),
+        new THREE.Quaternion().setFromAxisAngle(_up, fenceYaw + rng.range(-0.12, 0.12))
       );
     const m = new THREE.Matrix4().compose(new THREE.Vector3(wx, terrain.heightAt(wx, wz), wz), q, _one);
     (broken ? stumpXf : postXf).push({ m, tint: rng.range(-0.06, 0.06) });
