@@ -42,6 +42,8 @@ export class CharacterRig {
     this.root.name = 'CharacterRig';
     this.bones = {};
     this.parts = [];
+    /** @type {{cloth: import('./Cloth.js').VerletCloth, anchorBone: string}[]} */
+    this.cloths = [];
 
     this._buildSkeleton();
 
@@ -104,6 +106,35 @@ export class CharacterRig {
       bone(`shin${S}`, this.bones[`thigh${S}`], 0, -L.thigh, 0);
       bone(`foot${S}`, this.bones[`shin${S}`], 0, -L.shin, 0);
     }
+  }
+
+  /**
+   * Add an extra bone beyond the base humanoid set (cloak anchors, jaw,
+   * clavicles, tails, horns...). Safe to call any time after construction --
+   * the rest pose is captured immediately so `resetPose`/`setRot` work on it
+   * exactly like a base-skeleton bone.
+   */
+  addBone(name, parentName, x = 0, y = 0, z = 0) {
+    const b = new THREE.Group();
+    b.name = name;
+    b.position.set(x, y, z);
+    (this.bones[parentName] || this.root).add(b);
+    this.bones[name] = b;
+    this.restPose[name] = { position: b.position.clone(), quaternion: b.quaternion.clone() };
+    return b;
+  }
+
+  /**
+   * World-space quaternion of a bone, safe to call at any point in the frame
+   * (forces the matrix chain up to date rather than trusting the renderer to
+   * have refreshed it already). Used to rotate global forces -- gravity,
+   * wind, movement drag -- into a bone's local frame for cloth simulation.
+   */
+  getWorldQuaternion(boneName, target = new THREE.Quaternion()) {
+    const b = this.bones[boneName];
+    if (!b) return target.identity();
+    b.updateWorldMatrix(true, false);
+    return b.getWorldQuaternion(target);
   }
 
   /**
@@ -183,6 +214,9 @@ export class CharacterRig {
   dispose() {
     for (const m of this.parts) {
       m.geometry?.dispose?.();
+    }
+    for (const c of this.cloths) {
+      c.cloth?.dispose?.();
     }
   }
 }

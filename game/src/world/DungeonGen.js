@@ -1,5 +1,12 @@
 import { RNG } from '../core/RNG.js';
 
+/** All [x,y] cells in an w*h rectangle anchored at (x0,y0). */
+function rectCells(x0, y0, w, h) {
+  const out = [];
+  for (let y = y0; y < y0 + h; y++) for (let x = x0; x < x0 + w; x++) out.push([x, y]);
+  return out;
+}
+
 export const CELL = {
   ROCK: 0,   // solid, never rendered as interior
   FLOOR: 1,
@@ -150,6 +157,91 @@ export class DungeonGen {
       else if (rng.bool(0.12)) r.kind = 'shrine';
     }
 
+    // --- per-cell room ownership ---------------------------------------
+    // -1 means "corridor" (carved floor that belongs to no room rectangle).
+    // Consumers (wall tiering, prop density, room-identity dressing) key off
+    // this rather than re-deriving it from room rectangles every time.
+    const roomIndexGrid = new Int16Array(W * H).fill(-1);
+    for (const r of rooms) {
+      for (let yy = r.y; yy < r.y + r.h; yy++) {
+        for (let xx = r.x; xx < r.x + r.w; xx++) roomIndexGrid[at(xx, yy)] = r.id;
+      }
+    }
+    const roomAt = (x, y) => {
+      if (x < 0 || y < 0 || x >= W || y >= H) return null;
+      const i = roomIndexGrid[at(x, y)];
+      return i >= 0 ? rooms[i] : null;
+    };
+
+    // --- doorways --------------------------------------------------------
+    // Cells just outside a room's rectangle that are carved floor: this is
+    // where a corridor pierces the wall shell. Used to hang archways so a
+    // room reads as *entered* rather than just adjoined.
+    const rawDoorways = [];
+    for (const r of rooms) {
+      const edges = [
+        { cells: rectCells(r.x, r.y - 1, r.w, 1), dx: 0, dy: -1, axis: 'h' },
+        { cells: rectCells(r.x, r.y + r.h, r.w, 1), dx: 0, dy: 1, axis: 'h' },
+        { cells: rectCells(r.x - 1, r.y, 1, r.h), dx: -1, dy: 0, axis: 'v' },
+        { cells: rectCells(r.x + r.w, r.y, 1, r.h), dx: 1, dy: 0, axis: 'v' },
+      ];
+      for (const e of edges) {
+        for (const [x, y] of e.cells) {
+          if (x < 0 || y < 0 || x >= W || y >= H) continue;
+          if (grid[at(x, y)] === CELL.FLOOR) {
+            rawDoorways.push({ x, y, dx: e.dx, dy: e.dy, axis: e.axis, roomId: r.id });
+          }
+        }
+      }
+    }
+    // Greedy declutter: a wide corridor mouth produces several adjacent
+    // qualifying cells; keep one per ~2.5-cell cluster so arches don't stack.
+    const doorways = [];
+    for (const d of rawDoorways) {
+      if (doorways.some((k) => Math.hypot(k.x - d.x, k.y - d.y) < 2.5)) continue;
+      doorways.push(d);
+    }
+
+    // --- main route (entrance -> boss) -----------------------------------
+    // Cheap 4-directional BFS over the floor graph. Used purely for cosmetic
+    // wear (polished/worn tint, drainage channels along the spine) -- not
+    // authoritative pathing, that is NavGrid's job.
+    const mainRoute = new Set();
+    {
+      const prev = new Int32Array(W * H).fill(-2);
+      const sIdx = at(entrance.cx, entrance.cy), gIdx = at(far.cx, far.cy);
+      const q = [sIdx];
+      prev[sIdx] = -1;
+      let qi = 0;
+      while (qi < q.length) {
+        const cur = q[qi++];
+        if (cur === gIdx) break;
+        const cx = cur % W, cy = (cur - cx) / W;
+        for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+          const nx = cx + dx, ny = cy + dy;
+          if (nx < 0 || ny < 0 || nx >= W || ny >= H) continue;
+          const ni = at(nx, ny);
+          if (grid[ni] !== CELL.FLOOR || prev[ni] !== -2) continue;
+          prev[ni] = cur;
+          q.push(ni);
+        }
+      }
+      if (prev[gIdx] !== -2) {
+        let cur = gIdx;
+        while (cur !== -1) { mainRoute.add(cur); cur = prev[cur]; }
+      }
+      // Dilate by one ring so the worn strip has some width instead of
+      // reading as a single-pixel scratch down the corridor centreline.
+      for (const idx of [...mainRoute]) {
+        const x = idx % W, y = (idx - x) / W;
+        for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+          const nx = x + dx, ny = y + dy;
+          if (nx < 0 || ny < 0 || nx >= W || ny >= H) continue;
+          if (grid[at(nx, ny)] === CELL.FLOOR) mainRoute.add(at(nx, ny));
+        }
+      }
+    }
+
     return {
       width: W,
       height: H,
@@ -160,6 +252,10 @@ export class DungeonGen {
       boss: far,
       seed: this.rng.seed,
       at,
+      roomIndexGrid,
+      roomAt,
+      doorways,
+      mainRoute,
       isFloor: (x, y) =>
         x >= 0 && y >= 0 && x < W && y < H && grid[y * W + x] === CELL.FLOOR,
       isSolid: (x, y) =>
