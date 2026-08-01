@@ -67,7 +67,7 @@ export class CharacterRig {
       spine: H * 0.11,
       chest: H * 0.11,
       neck: H * 0.04,
-      head: H * 0.12,
+      head: H * 0.12 * s.headScale,
       shoulderX: H * 0.115 * s.build,
       upperArm: H * 0.155 * s.armLength,
       lowerArm: H * 0.145 * s.armLength,

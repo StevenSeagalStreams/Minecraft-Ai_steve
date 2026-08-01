@@ -1,12 +1,85 @@
 import * as THREE from 'three';
+import { Sky } from './Sky.js';
 
 /**
- * Lighting model for the dungeon.
+ * Lighting model, shared by every zone.
  *
  * The look rests on one idea: almost all light in the frame is *sourced*. A
  * very dim blue-grey ambient establishes shape in unlit corners, and every
  * bright thing in the scene is a physical emitter with visible falloff. That
  * contrast -- warm pools eating into cold dark -- is the entire Diablo mood.
+ *
+ * Two registers:
+ *   - Dungeon (default): a weak directional `key` from above-behind keeps
+ *     silhouettes legible between torches, which do the real work.
+ *   - Outdoor (`applyRig` called with sun data): a low-angle `sun` becomes
+ *     the key, a colored `rim` light separates silhouettes from the
+ *     background, and a procedural `Sky` dome + volumetrics god-ray/height-fog
+ *     pass (see Sky.js / Volumetrics.js, wired through PostFX) take over. The
+ *     dungeon `key` light stands down so the two registers never fight.
+ *
+ * ---------------------------------------------------------------------------
+ * `lightRig` schema (what a zone factory returns as `lightRig`, consumed via
+ * `applyRig`). All fields are optional; the zone deciding to set any of
+ * `sunElevation` / `sunAzimuth` is what flips a zone into the outdoor
+ * register (sun + rim + sky + volumetrics all switch on together).
+ *
+ *   sunColor          hex   DirectionalLight colour. Default 0xffffff.
+ *   sunIntensity      num   Directional intensity; also drives the Sky sun
+ *                           disc brightness. Default 2.5.
+ *   sunElevation      deg   Degrees above horizon. 0 = horizon (long rakes),
+ *                           90 = noon. Presence of this OR sunAzimuth is what
+ *                           triggers the outdoor register.
+ *   sunAzimuth        deg   Compass rotation around +Y.
+ *   ambientColor      hex   AmbientLight colour (unlit-corner fill).
+ *   ambientIntensity  num
+ *   hemiSky           hex   HemisphereLight sky colour.
+ *   hemiGround        hex   HemisphereLight ground colour.
+ *   hemiIntensity     num
+ *
+ *   -- extensions added by the lighting agent, all optional --
+ *   rimColor          hex   Colored rim/bounce light so silhouettes separate
+ *                           from the background. Default cool arcane blue
+ *                           0x5580ff.
+ *   rimIntensity      num   Default 0.55.
+ *   rimElevation      deg   Default 30.
+ *   rimAzimuthOffset  deg   Offset from (sunAzimuth + 180). Default 18 -- a
+ *                           pure backlight reads flat; a slight offset gives
+ *                           it a three-point-lighting feel.
+ *   sunDistance       num   How far the sun (and its shadow frustum) sits
+ *                           along the sun direction from the camera focus.
+ *                           Also used to place the Sky sun disc. Default 220.
+ *   shadowFocusRadius num   Half-extent (world units) of the sun's ortho
+ *                           shadow box. It is re-centred on the camera focus
+ *                           every frame (texel-snapped to kill shimmer)
+ *                           instead of sitting in one static box over the
+ *                           whole level. Default 42.
+ *   shadowBias        num   Default -0.00055.
+ *   shadowNormalBias  num   Default 0.09.
+ *   sky               bool  Set false to suppress the sky dome on an outdoor
+ *                           rig that wants lighting only. Default true.
+ *   skyZenith         hex   Sky gradient overrides; default derived from
+ *   skyHorizon        hex   ambientColor / sunColor / scene fog colour.
+ *   skyHaze           hex
+ *   cloudColor        hex   Blighted cloud layer. Defaults to a sick
+ *   cloudCoverage     0-1   green-grey, not white.
+ *   cloudiness        0-1
+ *   cloudSpeed        num
+ *   godrayStrength    num   0 disables the screen-space god-ray pass.
+ *                           Default 0.9.
+ *   groundFogHeight   num   World Y below which height-fog thickens (pools
+ *                           in hollows, thins on ridges). Default 2.5.
+ *   groundFogFalloff  num   Thickening rate per unit below groundFogHeight.
+ *                           Default 0.12.
+ *   groundFogDensity  num   Horizontal density term for the height-fog pass
+ *                           (separate from the uniform `zone.fog` distance
+ *                           fog). Default derived from zone.fog.density.
+ *   groundFogColor    hex   Default zone.fog colour.
+ *
+ * Everything above is consumed here and republished as `scene.userData.
+ * envLight` (direction, colour, godray/fog params, sky mesh ref) so PostFX
+ * can drive Volumetrics without any wiring through main.js.
+ * ---------------------------------------------------------------------------
  *
  * Shadow-casting point lights are expensive (6 faces each), so we keep a small
  * budget and assign it dynamically to the emitters nearest the camera target.
@@ -26,7 +99,9 @@ export class Lighting {
     scene.add(this.ambient);
 
     // A weak key from above-behind. Not a sun -- it exists to keep silhouettes
-    // legible when the player walks through an unlit stretch.
+    // legible when the player walks through an unlit stretch of dungeon. It
+    // stands down whenever applyRig() switches a zone into the outdoor
+    // register, where `sun` takes over as key.
     this.key = new THREE.DirectionalLight(0x8095c0, 0.85);
     this.key.position.set(-24, 40, -18);
     this.key.castShadow = true;
@@ -41,6 +116,18 @@ export class Lighting {
     this.key.shadow.camera.updateProjectionMatrix();
     scene.add(this.key);
     scene.add(this.key.target);
+
+    // Outdoor register: created lazily the first time applyRig sees sun data.
+    this.sun = null;
+    this.rim = null;
+    this.sky = null;
+    this._outdoor = false;
+    this._sunDir = new THREE.Vector3(0, 1, 0);
+    this._rimDir = new THREE.Vector3(0, 1, 0);
+    this._sunDistance = 220;
+    this._rimDistance = 130;
+    this.shadowFocusRadius = 42;
+    this._lastFocus = null;
 
     // Exponential fog kills the horizon and makes corridors recede into black.
     scene.fog = new THREE.FogExp2(0x05070c, 0.0135);
@@ -66,7 +153,175 @@ export class Lighting {
   }
 
   /**
-   * Register an emitter. `kind` selects a flicker profile.
+   * Apply (or re-apply) a zone's light rig. See the schema documented above
+   * the class. Safe to call more than once (a zone could animate its own rig
+   * over time via its `update(dt)`).
+   */
+  applyRig(rig = {}) {
+    this.rig = rig;
+
+    if (rig.hemiSky !== undefined) this.hemi.color.set(rig.hemiSky);
+    if (rig.hemiGround !== undefined) this.hemi.groundColor.set(rig.hemiGround);
+    if (rig.hemiIntensity !== undefined) this.hemi.intensity = rig.hemiIntensity;
+    if (rig.ambientColor !== undefined) this.ambient.color.set(rig.ambientColor);
+    if (rig.ambientIntensity !== undefined) this.ambient.intensity = rig.ambientIntensity;
+
+    this._outdoor = rig.sunElevation !== undefined || rig.sunAzimuth !== undefined;
+
+    if (this._outdoor) {
+      this._applySun(rig);
+      this._applyRim(rig);
+      this._applySky(rig);
+      this.key.visible = false;
+    } else {
+      this.key.visible = true;
+      if (this.sun) this.sun.visible = false;
+      if (this.rim) this.rim.visible = false;
+      if (this.sky) this.sky.mesh.visible = false;
+    }
+
+    this._publishEnvLight(rig);
+  }
+
+  _applySun(rig) {
+    if (!this.sun) {
+      this.sun = new THREE.DirectionalLight(0xffffff, 1);
+      this.sun.castShadow = true;
+      this.sun.shadow.mapSize.set(this.shadowSize, this.shadowSize);
+      this.sun.shadow.camera.near = 1;
+      this.scene.add(this.sun);
+      this.scene.add(this.sun.target);
+    }
+    this.sun.visible = true;
+    this.sun.color.set(rig.sunColor ?? 0xffffff);
+    this.sun.intensity = rig.sunIntensity ?? 2.5;
+
+    const elev = THREE.MathUtils.degToRad(rig.sunElevation ?? 45);
+    const az = THREE.MathUtils.degToRad(rig.sunAzimuth ?? 0);
+    this._sunDir.set(
+      Math.cos(elev) * Math.cos(az),
+      Math.sin(elev),
+      Math.cos(elev) * Math.sin(az)
+    ).normalize();
+
+    this._sunDistance = rig.sunDistance ?? 220;
+    this.shadowFocusRadius = rig.shadowFocusRadius ?? 42;
+    // Fixing peter-panning/acne on a low-angle light over uneven terrain
+    // needs more bias than an overhead light would: normalBias does the bulk
+    // of the work (it offsets the shadow lookup along the surface normal, so
+    // it scales correctly across the whole raking-angle range), bias is kept
+    // small so contact points don't visibly detach.
+    this.sun.shadow.bias = rig.shadowBias ?? -0.00055;
+    this.sun.shadow.normalBias = rig.shadowNormalBias ?? 0.09;
+    this.sun.shadow.radius = 2.2;
+    this.sun.shadow.camera.far = this._sunDistance * 2.4;
+
+    // Frame it immediately so the very first rendered frame (before update()
+    // has run once) is already correct, not a one-frame pop.
+    this._fitSunShadow(this._lastFocus || _ORIGIN);
+  }
+
+  _applyRim(rig) {
+    if (!this.rim) {
+      this.rim = new THREE.DirectionalLight(0xffffff, 1);
+      this.rim.castShadow = false; // cheap: it exists purely to separate silhouettes, not to ground them
+      this.scene.add(this.rim);
+      this.scene.add(this.rim.target);
+    }
+    this.rim.visible = true;
+    this.rim.color.set(rig.rimColor ?? 0x5580ff);
+    this.rim.intensity = rig.rimIntensity ?? 0.55;
+
+    const elev = THREE.MathUtils.degToRad(rig.rimElevation ?? 30);
+    const az = THREE.MathUtils.degToRad(
+      (rig.sunAzimuth ?? 0) + 180 + (rig.rimAzimuthOffset ?? 18)
+    );
+    this._rimDir.set(
+      Math.cos(elev) * Math.cos(az),
+      Math.sin(elev),
+      Math.cos(elev) * Math.sin(az)
+    ).normalize();
+    this._rimDistance = (rig.sunDistance ?? 220) * 0.6;
+
+    const focus = this._lastFocus || _ORIGIN;
+    this.rim.position.copy(focus).addScaledVector(this._rimDir, this._rimDistance);
+    this.rim.target.position.copy(focus);
+    this.rim.target.updateMatrixWorld();
+  }
+
+  _applySky(rig) {
+    if (rig.sky === false) {
+      if (this.sky) this.sky.mesh.visible = false;
+      return;
+    }
+    if (!this.sky) {
+      this.sky = new Sky();
+      this.scene.add(this.sky.mesh);
+    }
+    this.sky.mesh.visible = true;
+    const sunBrightness = THREE.MathUtils.clamp((rig.sunIntensity ?? 2.5) * 1.1, 0.8, 7);
+    this.sky.setSun(this._sunDir, rig.sunColor ?? 0xffffff, sunBrightness);
+    this.sky.setPalette({
+      zenith: rig.skyZenith ?? mixHex(rig.ambientColor ?? 0x1c2440, 0x03050a, 0.35),
+      horizon: rig.skyHorizon ?? rig.sunColor ?? 0xffb066,
+      haze: rig.skyHaze ?? (rig.groundFogColor ?? this._sceneFogColor() ?? 0x39423f),
+      cloudColor: rig.cloudColor ?? 0x4b5a4a,
+      cloudCoverage: rig.cloudCoverage ?? 0.45,
+      cloudiness: rig.cloudiness ?? 0.55,
+      cloudSpeed: rig.cloudSpeed ?? 0.015,
+    });
+  }
+
+  _sceneFogColor() {
+    return this.scene.fog ? this.scene.fog.color.getHex() : null;
+  }
+
+  _publishEnvLight(rig) {
+    if (!this._outdoor) {
+      this.scene.userData.envLight = null;
+      return;
+    }
+    const fogDensityBase = (this.scene.fog && this.scene.fog.density) || 0.01;
+    this.scene.userData.envLight = {
+      sunDirection: this._sunDir.clone(),
+      sunColor: this.sun.color.clone(),
+      godrayStrength: rig.godrayStrength ?? 0.9,
+      skyMesh: this.sky && rig.sky !== false ? this.sky.mesh : null,
+      fog: {
+        color: rig.groundFogColor ?? this._sceneFogColor() ?? 0x39423f,
+        height: rig.groundFogHeight ?? 2.5,
+        falloff: rig.groundFogFalloff ?? 0.12,
+        density: rig.groundFogDensity ?? fogDensityBase * 4,
+      },
+    };
+  }
+
+  /** Tightly-fit ortho shadow frustum, re-centred on the camera focus every
+   *  frame and snapped to shadow-texel increments so panning the focus does
+   *  not sub-texel-shift the shadow map (the classic cascaded-shadow shimmer
+   *  fix, applied here to a single well-fitted box rather than a static
+   *  34-unit box sitting over the whole outdoor level). */
+  _fitSunShadow(focus) {
+    const r = this.shadowFocusRadius;
+    const texel = (r * 2) / this.shadowSize;
+    const sx = Math.round(focus.x / texel) * texel;
+    const sz = Math.round(focus.z / texel) * texel;
+    _focusSnap.set(sx, focus.y, sz);
+
+    this.sun.position.copy(_focusSnap).addScaledVector(this._sunDir, this._sunDistance);
+    this.sun.target.position.copy(_focusSnap);
+    this.sun.target.updateMatrixWorld();
+
+    const cam = this.sun.shadow.camera;
+    cam.left = -r; cam.right = r; cam.top = r; cam.bottom = -r;
+    cam.near = Math.max(1, this._sunDistance - r * 2.5);
+    cam.far = this._sunDistance + r * 2.5;
+    cam.updateProjectionMatrix();
+  }
+
+  /**
+   * Register an emitter. `kind` selects a flicker + colour-temperature
+   * profile.
    * @returns {TorchLight}
    */
   addTorch(position, opts = {}) {
@@ -87,11 +342,32 @@ export class Lighting {
 
   setFogDensity(d) {
     if (this.scene.fog) this.scene.fog.density = d;
+    if (this.scene.userData.envLight) {
+      // Keep the height-fog pass's horizontal term roughly in step with the
+      // zone's distance fog unless a rig explicitly overrode it.
+      const rig = this.rig || {};
+      if (rig.groundFogDensity === undefined) {
+        this.scene.userData.envLight.fog.density = d * 4;
+      }
+    }
   }
 
   update(dt, focus) {
     this._time += dt;
     for (const t of this.torches) t.update(dt, this._time);
+
+    if (focus) this._lastFocus = this._lastFocus ? this._lastFocus.copy(focus) : focus.clone();
+
+    if (this._outdoor && this.sun) {
+      const f = this._lastFocus || _ORIGIN;
+      this._fitSunShadow(f);
+      if (this.rim) {
+        this.rim.position.copy(f).addScaledVector(this._rimDir, this._rimDistance);
+        this.rim.target.position.copy(f);
+        this.rim.target.updateMatrixWorld();
+      }
+      if (this.sky && this.sky.mesh.visible) this.sky.update(dt);
+    }
 
     if (!focus || this._shadowPool.length === 0) return;
 
@@ -135,14 +411,70 @@ export class Lighting {
   }
 }
 
+const _ORIGIN = new THREE.Vector3();
+const _focusSnap = new THREE.Vector3();
+
+function mixHex(a, b, t) {
+  return new THREE.Color(a).lerp(new THREE.Color(b), t).getHex();
+}
+
+/** Tanner Helland's blackbody approximation. Cheap, close enough at torchlight
+ *  temperatures (1000K-2500K) to sell "flares white-hot, gutters red" without
+ *  a lookup texture. */
+function kelvinToRGB(kelvin) {
+  const temp = kelvin / 100;
+  let r, g, b;
+  if (temp <= 66) {
+    r = 255;
+    g = 99.4708025861 * Math.log(temp) - 161.1195681661;
+  } else {
+    r = 329.698727446 * Math.pow(temp - 60, -0.1332047592);
+    g = 288.1221695283 * Math.pow(temp - 60, -0.0755148492);
+  }
+  if (temp >= 66) b = 255;
+  else if (temp <= 19) b = 0;
+  else b = 138.5177312231 * Math.log(temp - 10) - 305.0447927307;
+  return new THREE.Color(
+    THREE.MathUtils.clamp(r, 0, 255) / 255,
+    THREE.MathUtils.clamp(g, 0, 255) / 255,
+    THREE.MathUtils.clamp(b, 0, 255) / 255
+  );
+}
+
+function hash1(n) {
+  const s = Math.sin(n) * 43758.5453123;
+  return s - Math.floor(s);
+}
+function noise1D(x) {
+  const i = Math.floor(x);
+  const f = x - i;
+  const a = hash1(i);
+  const b = hash1(i + 1);
+  const u = f * f * (3 - 2 * f);
+  return a + (b - a) * u;
+}
+/** 4-octave value-noise fbm in [-1, 1]. Aperiodic (unlike a sum of sines),
+ *  which is what keeps a row of torches from ever reading as synchronized. */
+function fbmFlicker(x) {
+  let v = 0, amp = 0.5, freq = 1, norm = 0;
+  for (let o = 0; o < 4; o++) {
+    v += amp * (noise1D(x * freq) * 2 - 1);
+    norm += amp;
+    freq *= 2.17;
+    amp *= 0.5;
+  }
+  return v / norm;
+}
+
 const FLICKER = {
-  // amplitude, speed, jitter (positional), warmth swing
-  torch:   { amp: 0.22, speed: 7.5, jitter: 0.045, warmth: 0.06 },
-  brazier: { amp: 0.16, speed: 5.0, jitter: 0.030, warmth: 0.05 },
-  candle:  { amp: 0.32, speed: 11.0, jitter: 0.060, warmth: 0.08 },
-  magic:   { amp: 0.14, speed: 2.2, jitter: 0.010, warmth: 0.00 },
-  ember:   { amp: 0.09, speed: 1.4, jitter: 0.005, warmth: 0.03 },
-  steady:  { amp: 0.00, speed: 0.0, jitter: 0.000, warmth: 0.00 },
+  // amplitude, speed, jitter (positional); kelvin/swing drive real
+  // color-temperature falloff (flares whiter/hotter, gutters redder/cooler).
+  torch:   { amp: 0.24, speed: 2.6, jitter: 0.045, kelvin: 1900, swing: 550 },
+  brazier: { amp: 0.17, speed: 1.8, jitter: 0.030, kelvin: 1750, swing: 420 },
+  candle:  { amp: 0.34, speed: 3.6, jitter: 0.060, kelvin: 1650, swing: 600 },
+  magic:   { amp: 0.14, speed: 0.9, jitter: 0.010, kelvin: 0, swing: 0 },
+  ember:   { amp: 0.10, speed: 0.6, jitter: 0.005, kelvin: 1150, swing: 260 },
+  steady:  { amp: 0.00, speed: 0.0, jitter: 0.000, kelvin: 0, swing: 0 },
 };
 
 export class TorchLight {
@@ -156,25 +488,30 @@ export class TorchLight {
     this.castsShadow = opts.castShadow ?? false;
     this.usingShadowSlot = false;
 
+    // decay=2 is the physically-correct inverse-square falloff; `distance`
+    // is not a hard clip, three.js windows it smoothly to zero (a soft
+    // cutoff rather than a visible pop) so light never bleeds past its
+    // authored radius but also never terminates with a hard edge.
     this.light = new THREE.PointLight(this.baseColor.clone(), this.intensity, this.distance, 2.0);
     this.light.position.copy(position);
     this.basePosition = position.clone();
 
+    // Colour bias so at rest (flicker = 0) the light is exactly the authored
+    // `color`, and only drifts along the blackbody curve as it flares/gutters
+    // -- the zone author's colour choice is never fought, just modulated.
+    if (this.profile.kelvin > 0) {
+      const neutral = kelvinToRGB(this.profile.kelvin);
+      this._colorBias = new THREE.Color(
+        neutral.r > 0.001 ? this.baseColor.r / neutral.r : 1,
+        neutral.g > 0.001 ? this.baseColor.g / neutral.g : 1,
+        neutral.b > 0.001 ? this.baseColor.b / neutral.b : 1
+      );
+    } else {
+      this._colorBias = null;
+    }
+
     // Per-instance phase so a row of torches never pulses in unison.
     this._phase = Math.random() * 1000;
-    this._noiseState = Math.random();
-  }
-
-  /** Smooth-ish value noise driven by summed sines; cheap and non-periodic enough. */
-  _flicker(t) {
-    const p = this.profile;
-    const x = t * p.speed + this._phase;
-    return (
-      Math.sin(x) * 0.5 +
-      Math.sin(x * 2.31 + 1.7) * 0.28 +
-      Math.sin(x * 4.77 + 3.1) * 0.14 +
-      Math.sin(x * 9.13 + 5.5) * 0.08
-    );
   }
 
   update(dt, time) {
@@ -183,24 +520,24 @@ export class TorchLight {
       this.light.intensity = this.intensity;
       return;
     }
-    const f = this._flicker(time);
+    const f = fbmFlicker(time * p.speed + this._phase);
     this.light.intensity = Math.max(0, this.intensity * (1 + f * p.amp));
 
     if (p.jitter > 0) {
       this.light.position.set(
         this.basePosition.x + f * p.jitter,
-        this.basePosition.y + Math.sin(time * p.speed * 1.7 + this._phase) * p.jitter * 0.6,
-        this.basePosition.z + Math.sin(time * p.speed * 0.9 + this._phase * 2) * p.jitter
+        this.basePosition.y + noise1D(time * p.speed * 1.7 + this._phase + 50) * p.jitter * 0.6,
+        this.basePosition.z + noise1D(time * p.speed * 0.9 + this._phase + 90) * p.jitter
       );
     }
 
-    if (p.warmth > 0) {
-      // Real flame gets whiter as it flares and redder as it gutters.
-      const w = f * p.warmth;
+    if (this._colorBias) {
+      const k = p.kelvin + f * p.swing;
+      const kc = kelvinToRGB(k);
       this.light.color.setRGB(
-        Math.min(1, this.baseColor.r + w * 0.2),
-        Math.max(0, this.baseColor.g + w * 0.5),
-        Math.max(0, this.baseColor.b + w * 0.9)
+        kc.r * this._colorBias.r,
+        kc.g * this._colorBias.g,
+        kc.b * this._colorBias.b
       );
     }
   }

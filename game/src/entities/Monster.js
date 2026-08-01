@@ -1,46 +1,83 @@
 import * as THREE from 'three';
 import { Entity } from './Entity.js';
-import { buildSkeleton } from './Models.js';
+import * as Models from './Models.js';
+import { getMonsterProfile } from '../combat/MonsterProfiles.js';
+import { canCommitToAttack, propagateAggro } from '../combat/AggroPack.js';
 
 /**
- * Hostile actor with a small behaviour state machine.
+ * Hostile actor with a small behaviour state machine, driven by a per-`kind`
+ * profile (src/combat/MonsterProfiles.js).
  *
- * States: idle -> alert -> chase -> attack -> reposition. The reposition state
- * is the one that matters for feel: after swinging, a monster backs off and
- * circles briefly instead of standing in your face re-swinging. That single
- * behaviour is the difference between a fight with rhythm and a shoving match.
+ * States: idle -> alert -> chase -> attack -> reposition, plus `flank` for
+ * pack members that want to fight but do not currently have an attack slot
+ * (see `_canCommit`). That is the M1 pack-coordination behaviour: rather than
+ * everyone queuing up to swing one at a time, only `profile.packMaxAttackers`
+ * monsters commit to `attack` at once and the rest circle at a wider radius,
+ * waiting for an opening -- which is what makes a pack feel like it is
+ * surrounding you instead of politely taking turns.
+ *
+ * Two M1 kinds, genuinely different to fight:
+ *   swarmer  -- fast, erratic (weaves while closing, see _followPath), low
+ *               health, packs up to 3 attackers at once.
+ *   skeleton -- slower, holds ground, long telegraphed wind-up, hits harder,
+ *               only 2 attackers commit at once.
+ * `buildMonster(kind, opts)` is used for the model if Models.js exports it
+ * yet (it is being rewritten in parallel); otherwise this falls back to
+ * `buildSkeleton` for every kind, per the mission brief, so a missing export
+ * degrades to "wrong-looking monster" rather than a crash.
  */
 export class Monster extends Entity {
   constructor(opts = {}) {
+    const kind = opts.kind ?? 'skeleton';
+    const profile = getMonsterProfile(kind);
+
+    // NOTE for the report: main.js currently spawns every non-`brute` monster
+    // with the same flat maxHealth fallback (46) because it does not know
+    // about the swarmer/skeleton split -- it only branches on `kind ===
+    // 'brute'`. If we honoured opts.maxHealth here, swarmer and skeleton
+    // would have identical health and the "genuinely different to fight"
+    // requirement would be dead on arrival. So the profile wins for every
+    // stat that defines how a kind *fights*; only `height` (harmless per-
+    // spawn visual variety) still takes the caller's value.
     super({
       type: 'monster',
       faction: 'hostile',
-      radius: 0.38,
-      height: 1.72,
-      mass: 0.9,
-      moveSpeed: 3.4,
-      acceleration: 22,
-      friction: 18,
-      maxHealth: 46,
-      ...opts,
+      radius: profile.radius,
+      height: opts.height ?? profile.height,
+      mass: profile.mass,
+      moveSpeed: profile.moveSpeed,
+      acceleration: profile.acceleration,
+      friction: profile.friction,
+      maxHealth: profile.maxHealth,
+      armor: profile.armor,
+      critChance: profile.critChance,
+      critMultiplier: profile.critMultiplier,
     });
 
-    const { rig, materials } = buildSkeleton({ height: this.height });
-    this.setRig(rig, { strideLength: 1.05, bounce: 1.25, weight: 0.75, idleSway: 0.6 });
+    this.kind = kind;
+    this.profile = profile;
+
+    const { rig, materials } = Monster._buildModel(kind, this.height);
+    this.setRig(rig, {
+      strideLength: profile.strideLength,
+      bounce: profile.bounce,
+      weight: profile.weight,
+      idleSway: profile.idleSway,
+    });
     this.materials = materials;
 
     this.state = 'idle';
     this.stateTime = 0;
 
-    this.aggroRange = opts.aggroRange ?? 13;
-    this.leashRange = opts.leashRange ?? 34;
-    this.attackRange = opts.attackRange ?? 1.95;
-    this.attackDamage = opts.attackDamage ?? 9;
-    this.attackDuration = opts.attackDuration ?? 0.78;
+    this.aggroRange = opts.aggroRange ?? profile.aggroRange;
+    this.leashRange = opts.leashRange ?? profile.leashRange;
+    this.attackRange = opts.attackRange ?? profile.attackRange;
+    this.attackDamage = opts.attackDamage ?? profile.attackDamage;
+    this.attackDuration = profile.attackDuration;
     this.attackCooldown = 0;
-    this.attackInterval = opts.attackInterval ?? 1.55;
+    this.attackInterval = profile.attackInterval;
 
-    this.experienceValue = opts.experienceValue ?? 14;
+    this.experienceValue = opts.experienceValue ?? profile.experienceValue;
     this.spawnPoint = new THREE.Vector3();
 
     this._repathTimer = 0;
@@ -48,12 +85,65 @@ export class Monster extends Entity {
     // the same frame and you get a visible hitch every time they all think.
     this._repathOffset = Math.random() * 0.4;
     this._circleDir = Math.random() < 0.5 ? -1 : 1;
+    this._erraticPhase = Math.random() * Math.PI * 2;
+  }
+
+  static _buildModel(kind, height) {
+    if (typeof Models.buildMonster === 'function') {
+      try {
+        const built = Models.buildMonster(kind, { height });
+        if (built && built.rig) return built;
+      } catch (err) {
+        console.warn(`[Monster] buildMonster('${kind}') failed, falling back to buildSkeleton`, err);
+      }
+    }
+    return Models.buildSkeleton({ height });
   }
 
   setState(s) {
     if (this.state === s) return;
     this.state = s;
     this.stateTime = 0;
+  }
+
+  /** Is there an open attack slot for this pack right now? */
+  _canCommit(world) {
+    return canCommitToAttack(this, world.monsters || [], this.profile.packMaxAttackers);
+  }
+
+  /**
+   * Aggro propagation: taking a hit wakes idle neighbours within
+   * `profile.alertRadius`, and wakes the victim itself if it was still idle.
+   * That single override is what makes "hit one, wake the pack" work for
+   * both kinds without any change to Entity.damage().
+   */
+  damage(amount, source = null, opts = {}) {
+    if (!this.alive) return 0;
+    const dealt = super.damage(amount, source, opts);
+    if (this._world) {
+      if (this.state === 'idle') this.setState('alert');
+      propagateAggro(this, this._world.monsters || [], this.profile.alertRadius);
+    }
+    return dealt;
+  }
+
+  /**
+   * Swarmers weave side to side while closing distance instead of beelining,
+   * which is most of what makes them read as erratic/darting rather than
+   * just "fast skeleton". Skeletons barely weave (profile.erratic is small),
+   * so they read as deliberate.
+   */
+  _followPath(dt) {
+    const desired = super._followPath(dt);
+    if (this.profile.erratic > 0.25 && desired.lengthSq() > 0.0001) {
+      this._erraticPhase += dt * (3 + this.profile.erratic * 4);
+      const jag = Math.sin(this._erraticPhase) * this.profile.erratic * 0.55;
+      const px = -desired.z, pz = desired.x; // perpendicular to travel
+      desired.x += px * jag;
+      desired.z += pz * jag;
+      if (desired.lengthSq() > 0.0001) desired.normalize();
+    }
+    return desired;
   }
 
   update(dt, world) {
@@ -73,14 +163,18 @@ export class Monster extends Entity {
 
       case 'alert':
         // A beat of hesitation before charging. Instant aggro reads as robotic;
-        // a ~0.3s tell lets the player see the pack wake up.
+        // a short tell lets the player see the pack wake up.
         this.faceTowards(player.position.x, player.position.z);
         if (this.stateTime > 0.28) this.setState('chase');
         break;
 
       case 'chase': {
         if (dist > this.leashRange) { this.setState('idle'); this.clearPath(); break; }
-        if (dist <= this.attackRange) { this.setState('attack'); this.clearPath(); break; }
+        if (dist <= this.attackRange) {
+          this.setState(this._canCommit(world) ? 'attack' : 'flank');
+          this.clearPath();
+          break;
+        }
         if (this._repathTimer <= 0) {
           this._repathTimer = 0.35 + this._repathOffset;
           const p = world.nav?.path(
@@ -92,14 +186,46 @@ export class Monster extends Entity {
         break;
       }
 
+      // Not enough attack slots free right now -- circle at a wider radius,
+      // watching for an opening, instead of queueing into the player's face.
+      case 'flank': {
+        if (dist > this.leashRange) { this.setState('idle'); this.clearPath(); break; }
+        if (dist > this.attackRange * 2.6) { this.setState('chase'); break; }
+        this.faceTowards(player.position.x, player.position.z);
+        if (dist <= this.attackRange * 1.15 && this._canCommit(world)) {
+          this.setState('attack');
+          this.clearPath();
+          break;
+        }
+        this._erraticPhase += dt * (1.4 + this.profile.erratic * 2.6);
+        const ang = Math.atan2(
+          this.position.x - player.position.x,
+          this.position.z - player.position.z
+        ) + this._circleDir * (0.65 + Math.sin(this._erraticPhase) * 0.3 * this.profile.erratic);
+        const r = this.attackRange * this.profile.circleRadiusMul * 1.6;
+        this.setPath([{
+          x: player.position.x + Math.sin(ang) * r,
+          z: player.position.z + Math.cos(ang) * r,
+        }]);
+        break;
+      }
+
       case 'attack': {
         this.clearPath();
         this.faceTowards(player.position.x, player.position.z);
         if (dist > this.attackRange * 1.25) { this.setState('chase'); break; }
         if (this.attackCooldown <= 0 && !this.animator.busy) {
           this.attackCooldown = this.attackInterval;
+          const p = this.profile;
+          // The wind-up must be visible: skeletons get a long, deliberate
+          // telegraph (impact fires late in a long swing), swarmers get a
+          // quick snap. Both are just the animation timing this monster
+          // requests -- no separate "telegraph" system needed.
           this.animator.play('attackSwing', this.attackDuration, {
-            events: [{ at: 0.45, name: 'impact' }],
+            events: [
+              { at: p.whooshEventAt, name: 'whoosh' },
+              { at: p.windupEventAt, name: 'impact' },
+            ],
             onEvent: (name) => {
               if (name !== 'impact') return;
               if (!player.alive) return;
@@ -107,11 +233,10 @@ export class Monster extends Entity {
               const dir = new THREE.Vector3(
                 player.position.x - this.position.x, 0, player.position.z - this.position.z
               ).normalize();
-              player.damage(this.attackDamage, this, { direction: dir, stagger: 0.5 });
-              player.applyKnockback(dir.x, dir.z, 1.6);
-              world.bus?.emit('combat:hit', {
-                attacker: this, victim: player, amount: this.attackDamage, direction: dir,
-              });
+              const variance = 1 + (Math.random() * 2 - 1) * p.attackVariance;
+              player.damage(this.attackDamage * variance, this, { direction: dir, stagger: p.stagger });
+              // Knockback, hit-stop, crit, camera shake and combat:hit are all
+              // resolved centrally inside player.damage() -> Entity.damage().
             },
           });
           this.setState('reposition');
@@ -120,14 +245,19 @@ export class Monster extends Entity {
       }
 
       case 'reposition': {
-        // Strafe around the player while the swing recovers.
-        if (this.stateTime > 0.55) { this.setState(dist <= this.attackRange * 1.2 ? 'attack' : 'chase'); break; }
+        // Strafe around the player while the swing recovers, then re-offer
+        // the attack slot to the pack coordinator.
+        if (this.stateTime > this.profile.repositionTime) {
+          if (dist <= this.attackRange * 1.2 && this._canCommit(world)) this.setState('attack');
+          else this.setState(dist <= this.attackRange * 2.2 ? 'flank' : 'chase');
+          break;
+        }
         this.faceTowards(player.position.x, player.position.z);
         const ang = Math.atan2(
           this.position.x - player.position.x,
           this.position.z - player.position.z
         ) + this._circleDir * 0.9;
-        const r = this.attackRange * 0.95;
+        const r = this.attackRange * this.profile.circleRadiusMul * 0.95;
         this.setPath([{
           x: player.position.x + Math.sin(ang) * r,
           z: player.position.z + Math.cos(ang) * r,

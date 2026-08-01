@@ -1,11 +1,16 @@
 import * as THREE from 'three';
+import * as CT from './CharacterTextures.js';
 
 /**
- * Shared procedural geometry primitives for characters.
+ * Shared procedural geometry + material primitives for characters.
  *
  * Everything here is authored to be attached to a bone: pivots are baked into
  * the geometry (via translate) rather than left to the caller, and normals are
  * always recomputed after deformation so lighting reads correctly.
+ *
+ * `characterMaterials` also lives here (rather than in Models.js) so that both
+ * Models.js and the monster builders under monsters/ can depend on it without
+ * a circular import between the two.
  */
 
 // ---------------------------------------------------------------------------
@@ -167,4 +172,52 @@ export function rivetRing(material, count, r, y, radius = 0.008, z0 = 0) {
     pos.push([Math.sin(a) * r, y, Math.cos(a) * r + z0]);
   }
   return rivetInstances(material, pos, radius);
+}
+
+// ---------------------------------------------------------------------------
+// materials
+// ---------------------------------------------------------------------------
+
+let _matSeed = 1;
+
+/**
+ * Full PBR material set for a character build. Every material carries a
+ * procedurally generated albedo/normal/roughness(/AO) set from
+ * CharacterTextures.js -- a flat `color`-only MeshStandardMaterial is an
+ * automatic critic fail, so the scalar `color` here only tints the generated
+ * map rather than standing in for one.
+ *
+ * @param {object} palette   colour overrides, e.g. { metal: 0x9099a0 }
+ * @param {number} [seed]    texture seed; omit to get a fresh one each call so
+ *                           unrelated characters do not tile identically.
+ */
+export function characterMaterials(palette = {}, seed) {
+  const texSeed = seed ?? (_matSeed++);
+  const p = {
+    skin: 0x9a7660,
+    cloth: 0x3a2f2a,
+    leather: 0x4a3527,
+    metal: 0x8b8d92,
+    metalDark: 0x4a4d55,
+    accent: 0x8c2f24,
+    bone: 0xcfc6ad,
+    ...palette,
+  };
+
+  const skinMaps = CT.skinMaps(texSeed);
+  const clothMaps = CT.clothMaps(texSeed);
+  const leatherMaps = CT.leatherMaps(texSeed);
+  const metalMaps = CT.metalMaps(texSeed);
+  const boneMaps = CT.boneMaps(texSeed);
+  const accentMaps = CT.accentMaps(texSeed);
+
+  return {
+    skin: new THREE.MeshStandardMaterial({ color: p.skin, roughness: 0.6, metalness: 0.0, ...skinMaps }),
+    cloth: new THREE.MeshStandardMaterial({ color: p.cloth, roughness: 0.92, metalness: 0.0, ...clothMaps }),
+    leather: new THREE.MeshStandardMaterial({ color: p.leather, roughness: 0.6, metalness: 0.03, ...leatherMaps }),
+    metal: new THREE.MeshStandardMaterial({ color: p.metal, roughness: 0.28, metalness: 1.0, envMapIntensity: 1.15, ...metalMaps }),
+    metalDark: new THREE.MeshStandardMaterial({ color: p.metalDark, roughness: 0.40, metalness: 0.97, envMapIntensity: 0.95, ...metalMaps }),
+    accent: new THREE.MeshStandardMaterial({ color: p.accent, roughness: 0.72, metalness: 0.0, ...accentMaps }),
+    bone: new THREE.MeshStandardMaterial({ color: p.bone, roughness: 0.6, metalness: 0.05, ...boneMaps }),
+  };
 }

@@ -37,10 +37,10 @@ export function createRenderer(canvas) {
 
 /** Quality presets. Critic screenshots always run at 'ultra'. */
 export const QUALITY = {
-  low:    { pixelRatio: 1,   shadowSize: 512,  ssao: false, bloom: true,  grain: false, softShadows: false },
-  medium: { pixelRatio: 1,   shadowSize: 1024, ssao: true,  bloom: true,  grain: true,  softShadows: false },
-  high:   { pixelRatio: 1.5, shadowSize: 2048, ssao: true,  bloom: true,  grain: true,  softShadows: true },
-  ultra:  { pixelRatio: 2,   shadowSize: 4096, ssao: true,  bloom: true,  grain: true,  softShadows: true },
+  low:    { pixelRatio: 1,   shadowSize: 512,  ssao: false, bloom: true,  grain: false, softShadows: false, volumetrics: false },
+  medium: { pixelRatio: 1,   shadowSize: 1024, ssao: true,  bloom: true,  grain: true,  softShadows: false, volumetrics: true },
+  high:   { pixelRatio: 1.5, shadowSize: 2048, ssao: true,  bloom: true,  grain: true,  softShadows: true,  volumetrics: true },
+  ultra:  { pixelRatio: 2,   shadowSize: 4096, ssao: true,  bloom: true,  grain: true,  softShadows: true,  volumetrics: true },
 };
 
 export function applyQuality(renderer, preset) {

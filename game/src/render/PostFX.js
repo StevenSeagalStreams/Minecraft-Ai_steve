@@ -6,6 +6,7 @@ import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPa
 import { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js';
 import { SMAAPass } from 'three/examples/jsm/postprocessing/SMAAPass.js';
 import { GTAOPass } from 'three/examples/jsm/postprocessing/GTAOPass.js';
+import { VolumetricsPass } from './Volumetrics.js';
 
 /**
  * The grade pass. This is where the game gets its face.
@@ -152,25 +153,38 @@ export class PostFX {
     this.composer.addPass(this.renderPass);
 
     // --- ambient occlusion -------------------------------------------------
+    // GTAO's own g-buffer prepass (depth + view-space normals) is reused by
+    // the Volumetrics pass below for height fog, so outdoor zones do not pay
+    // for a second full-scene depth render.
     this.gtao = new GTAOPass(scene, camera, size.x, size.y);
     this.gtao.output = GTAOPass.OUTPUT.Default;
-    this.gtao.blendIntensity = 0.85;
+    this.gtao.blendIntensity = 1.0;
     this.gtao.updateGtaoMaterial({
-      radius: 0.55,
-      distanceExponent: 1.4,
-      thickness: 0.6,
+      radius: 0.62,
+      distanceExponent: 1.3,
+      thickness: 0.7,
       scale: 1.0,
-      samples: 16,
+      samples: 24,
       distanceFallOff: 1.0,
       screenSpaceRadius: false,
     });
+    this.gtao.updatePdMaterial({ lumaPhi: 8, depthPhi: 3, normalPhi: 6, radius: 5, radiusExponent: 1.8, rings: 3, samples: 12 });
     this.gtao.enabled = quality.ssao !== false;
     this.composer.addPass(this.gtao);
 
+    // --- volumetrics: god rays + height fog ---------------------------------
+    // Free (and disabled) on dungeon zones, which never publish
+    // scene.userData.envLight -- see Lighting.applyRig / Volumetrics.js.
+    this.volumetrics = new VolumetricsPass();
+    this.volumetrics.enabled = quality.volumetrics !== false;
+    this.composer.addPass(this.volumetrics);
+
     // --- bloom -------------------------------------------------------------
     // threshold > 1.0 makes this physically selective: only emitters that
-    // actually exceed white (fire, spell cores, hot metal) bloom.
-    this.bloom = new UnrealBloomPass(new THREE.Vector2(size.x, size.y), 0.62, 0.72, 1.05);
+    // actually exceed white (fire, spell cores, the sun disc) bloom. Kept
+    // tight (small radius, modest strength) so it reads as hot cores, not a
+    // haze over the whole frame.
+    this.bloom = new UnrealBloomPass(new THREE.Vector2(size.x, size.y), 0.55, 0.42, 1.05);
     this.bloom.enabled = quality.bloom !== false;
     this.composer.addPass(this.bloom);
 
@@ -187,6 +201,8 @@ export class PostFX {
     this.composer.addPass(this.smaa);
 
     this._time = 0;
+    this._sunWorld = new THREE.Vector3();
+    this._sunClip = new THREE.Vector4();
   }
 
   /** Push transient looks: hit flashes, low-health desaturation, level intros. */
@@ -194,14 +210,48 @@ export class PostFX {
   setSaturation(v) { this.grade.uniforms.saturation.value = v; }
   setVignette(v) { this.grade.uniforms.vignette.value = v; }
 
+  /** Feed the Volumetrics pass from whatever Lighting last published. Reads
+   *  scene.userData rather than taking a direct reference so main.js never
+   *  needs to wire Lighting and PostFX together. */
+  _updateVolumetrics() {
+    const env = this.scene.userData.envLight;
+    if (!env || !this.volumetrics.enabled) {
+      this.volumetrics.disableAll();
+      return;
+    }
+
+    this.volumetrics.updateCamera(this.camera);
+    this.volumetrics.setDepthTexture(this.gtao.depthTexture ?? null);
+    this.volumetrics.setFog(env.fog);
+
+    // Project a point far along the sun direction into screen space by hand
+    // (Vector3.project() divides by w before we can check its sign, which
+    // mirrors off-screen when the sun is behind the camera).
+    this._sunWorld.copy(this.camera.position).addScaledVector(env.sunDirection, 300);
+    this._sunClip.set(this._sunWorld.x, this._sunWorld.y, this._sunWorld.z, 1)
+      .applyMatrix4(this.camera.matrixWorldInverse)
+      .applyMatrix4(this.camera.projectionMatrix);
+
+    if (this._sunClip.w > 0) {
+      const x = this._sunClip.x / this._sunClip.w;
+      const y = this._sunClip.y / this._sunClip.w;
+      this.volumetrics.setSun({ x: x * 0.5 + 0.5, y: y * 0.5 + 0.5 }, env.godrayStrength);
+    } else {
+      this.volumetrics.setSun(null, 0);
+    }
+  }
+
   update(dt) {
     this._time += dt;
     this.grade.uniforms.time.value = this._time;
+    this.volumetrics.update(dt);
+    this._updateVolumetrics();
   }
 
   setSize(w, h) {
     this.composer.setSize(w, h);
     this.gtao.setSize(w, h);
+    this.volumetrics.setSize(w, h);
     this.bloom.setSize(w, h);
     this.smaa.setSize(w, h);
     this.grade.uniforms.resolution.value.set(w, h);

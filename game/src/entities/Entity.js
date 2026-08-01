@@ -1,5 +1,8 @@
 import * as THREE from 'three';
 import { Animator } from './Animation.js';
+import { computeDamage } from '../combat/Damage.js';
+import { knockbackForce } from '../combat/Knockback.js';
+import { HitStop } from '../combat/HitStop.js';
 
 let _nextId = 1;
 
@@ -37,6 +40,21 @@ export class Entity {
     this.health = this.maxHealth;
     this.alive = true;
     this.deathTimer = 0;
+
+    // Combat stats. Physical damage, armour reduction and crits are all
+    // resolved centrally in damage() via src/combat/Damage.js -- these are
+    // just the per-entity inputs to that one auditable formula.
+    this.armor = opts.armor ?? 0;
+    this.critChance = opts.critChance ?? 0;
+    this.critMultiplier = opts.critMultiplier ?? 1.5;
+
+    /** Cached from the most recent update(dt, world) call. damage() can be
+     *  invoked outside of update() (e.g. from an attack's onImpact callback
+     *  earlier in the same frame), so this is refreshed every tick rather
+     *  than captured once at construction time. */
+    this._world = null;
+    /** Directional, varied death collapse -- see kill(). */
+    this._collapse = null;
 
     /** @type {{x:number,z:number}[]|null} */
     this.path = null;
@@ -84,14 +102,75 @@ export class Entity {
     this.knockback.z += dirZ * force * inv;
   }
 
+  /**
+   * The one auditable place damage is computed and applied. Every hit in the
+   * game -- player swinging on a monster, a monster swinging on the player --
+   * ends up calling `victim.damage(rawAmount, attacker, opts)`, so armour
+   * reduction (victim.armor), crit rolls (attacker.critChance/Multiplier),
+   * knockback (mass-scaled), hit-stop, camera shake and the `combat:hit`
+   * event all happen exactly once, right here, regardless of which call site
+   * triggered it. See computeDamage() in src/combat/Damage.js for the actual
+   * math and its self-test for the guarantees (no NaN, bounded armour).
+   */
   damage(amount, source = null, opts = {}) {
     if (!this.alive) return 0;
-    const dealt = Math.max(0, amount);
-    this.health -= dealt;
-    if (this.animator && opts.direction) this.animator.hit(opts.direction, opts.stagger ?? 0.6);
+
+    const rngFn = (this._world && this._world.rng && typeof this._world.rng.next === 'function')
+      ? () => this._world.rng.next()
+      : Math.random;
+
+    const result = computeDamage({
+      baseAmount: amount,
+      armor: this.armor,
+      critChance: source?.critChance ?? 0,
+      critMultiplier: source?.critMultiplier ?? this.critMultiplier,
+      forceCrit: typeof opts.crit === 'boolean' ? opts.crit : undefined,
+      rng: rngFn,
+    });
+
+    const dealt = result.amount;
+    this.health = Math.max(0, this.health - dealt);
+
+    if (opts.direction) {
+      const force = knockbackForce(dealt, { crit: result.crit, flat: opts.knockback ?? 0 });
+      this.applyKnockback(opts.direction.x, opts.direction.z, force);
+    }
+    if (this.animator && opts.direction) {
+      const strength = result.crit
+        ? 1
+        : Math.min(1, 0.35 + (dealt / Math.max(1, this.maxHealth)) * 1.8);
+      this.animator.hit(opts.direction, opts.stagger ?? strength);
+    }
     if (opts.stun) this.stunTimer = Math.max(this.stunTimer, opts.stun);
+
+    // Hit-stop: the single highest-leverage trick for melee to read as
+    // connecting. Crits freeze harder and longer; a merely "heavy" hit (a big
+    // chunk of the victim's max health in one blow) gets a shorter, lighter
+    // slow. Both numbers are in real frames -- see HitStop.js for why that
+    // guarantees release.
+    const heavyFrac = this.maxHealth > 0 ? dealt / this.maxHealth : 0;
+    if (result.crit) HitStop.trigger(5, 0.04);
+    else if (heavyFrac >= 0.16) HitStop.trigger(3, 0.15);
+
+    // Camera feedback. `world.bus` is the documented channel; `window.__game`
+    // is the mission-specified fallback straight to the rig's own trauma
+    // accumulator, since `world` does not carry a reference to the rig.
+    if (result.crit || heavyFrac >= 0.12) {
+      const trauma = Math.min(1, (result.crit ? 0.22 : 0.10) + heavyFrac * 0.3);
+      this._world?.bus?.emit?.('camera:shake', { trauma });
+      if (typeof window !== 'undefined') {
+        try { window.__game?.rig?.addTrauma?.(trauma); } catch { /* non-browser/headless: no-op */ }
+      }
+    }
+
+    this._world?.bus?.emit?.('combat:hit', {
+      attacker: source, victim: this, amount: dealt, direction: opts.direction ?? null, crit: result.crit,
+    });
+
     if (this.health <= 0) {
       this.health = 0;
+      this._deathDirection = opts.direction ? { x: opts.direction.x, z: opts.direction.z } : null;
+      this._deathForce = dealt;
       this.kill(source);
     }
     return dealt;
@@ -104,13 +183,41 @@ export class Entity {
     return this.health - before;
   }
 
-  kill() {
+  /**
+   * Not literal rigid-body ragdoll -- a directional, varied tip-over of the
+   * whole entity container, layered on top of whatever Animation.js's own
+   * `_poseDeath` does to individual bones (we do not own Animation.js, so
+   * this happens one level up: `this.object` is the group Entity itself
+   * owns, and `rig.root` is just a child of it, so the two transforms
+   * compose). A body killed by a hit from the left falls to the right,
+   * because the tip direction comes straight from the killing blow's
+   * direction; force and a little randomness vary how hard/fast it goes.
+   */
+  kill(source = null) {
     if (!this.alive) return;
     this.alive = false;
     this.deathTimer = 0;
     this.clearPath();
     this.velocity.set(0, 0, 0);
     this.animator?.die();
+
+    const dir = this._deathDirection;
+    const forceFrac = THREE.MathUtils.clamp(
+      (this._deathForce ?? 0) / Math.max(1, this.maxHealth * 0.5), 0.35, 1.6
+    );
+    this._collapse = {
+      // Fall away from the blow; if we don't know a direction (e.g. a scripted
+      // kill with no hit direction), fall forward along current facing.
+      dirX: dir ? dir.x : Math.sin(this.facing),
+      dirZ: dir ? dir.z : Math.cos(this.facing),
+      twist: (Math.random() - 0.5) * 0.6,
+      amount: THREE.MathUtils.clamp(0.95 + forceFrac * 0.3 + Math.random() * 0.25, 0.85, 1.5),
+      duration: THREE.MathUtils.clamp(0.9 - forceFrac * 0.25 + Math.random() * 0.2, 0.45, 1.0),
+    };
+
+    // Diablo rule: corpses persist. This entity does not despawn itself on a
+    // timer -- see the note in the mission report about main.js's reaper.
+    this._world?.bus?.emit?.('combat:kill', { attacker: source, victim: this });
   }
 
   /** Steering toward the current path waypoint. Returns desired velocity. */
@@ -146,9 +253,19 @@ export class Entity {
   }
 
   update(dt, world) {
+    this._world = world;
+
     if (!this.alive) {
       this.deathTimer += dt;
       this.animator?.update(dt, { speed: 0, facing: this.facing });
+      if (this._collapse) {
+        const c = this._collapse;
+        const t = Math.min(1, this.deathTimer / c.duration);
+        const e = 1 - Math.pow(1 - t, 3); // ease-out settle
+        this.object.rotation.x = c.dirZ * c.amount * e;
+        this.object.rotation.z = -c.dirX * c.amount * e;
+        this.object.rotation.y = this.facing + c.twist * e;
+      }
       return;
     }
 
@@ -159,11 +276,17 @@ export class Entity {
       this._followPath(dt);
     }
 
+    // Hit-stop scales physics AND animation together, in this one place --
+    // that is the whole trick. Status timers above (stun) intentionally keep
+    // running in real time; only motion and the animator's own clock freeze.
+    const hitStopScale = HitStop.scale;
+    const sdt = dt * hitStopScale;
+
     // --- velocity integration ----------------------------------------------
     const target = this._tmp.copy(this._desired).multiplyScalar(this.moveSpeed);
     const accel = this._desired.lengthSq() > 0.0001 ? this.acceleration : this.friction;
     const dv = target.sub(this.velocity);
-    const maxDelta = accel * dt;
+    const maxDelta = accel * sdt;
     if (dv.lengthSq() > maxDelta * maxDelta) dv.setLength(maxDelta);
     this.velocity.add(dv);
     this.velocity.y = 0;
@@ -171,12 +294,12 @@ export class Entity {
     // knockback decays fast; it is an impulse, not a state
     if (this.knockback.lengthSq() > 0.0001) {
       this.velocity.add(this.knockback);
-      this.knockback.multiplyScalar(Math.exp(-9 * dt));
+      this.knockback.multiplyScalar(Math.exp(-9 * sdt));
     }
 
     // --- collision-aware move ----------------------------------------------
-    const nx = this.position.x + this.velocity.x * dt;
-    const nz = this.position.z + this.velocity.z * dt;
+    const nx = this.position.x + this.velocity.x * sdt;
+    const nz = this.position.z + this.velocity.z * sdt;
     const colliders = world?.colliders;
 
     if (colliders) {
@@ -202,11 +325,11 @@ export class Entity {
     let diff = this.targetFacing - this.facing;
     while (diff > Math.PI) diff -= Math.PI * 2;
     while (diff < -Math.PI) diff += Math.PI * 2;
-    const turn = THREE.MathUtils.clamp(diff, -this.turnRate * dt, this.turnRate * dt);
+    const turn = THREE.MathUtils.clamp(diff, -this.turnRate * sdt, this.turnRate * sdt);
     this.facing += turn;
     this.object.rotation.y = this.facing;
 
-    this.animator?.update(dt, { speed: this.speed, facing: this.facing });
+    this.animator?.update(sdt, { speed: this.speed, facing: this.facing });
   }
 
   distanceTo(other) {
@@ -224,8 +347,14 @@ export class Entity {
 /**
  * Separation steering so a pack of monsters does not converge into one
  * flickering z-fighting pile at the player's feet.
+ *
+ * main.js calls this exactly once per real frame (it is the load-bearing
+ * "overlap resolution" phase in the fixed update order), which makes it the
+ * one safe place to burn a single frame off the global hit-stop counter --
+ * see HitStop.js for why that guarantees the freeze always releases.
  */
 export function resolveOverlaps(entities, iterations = 2) {
+  HitStop.tickFrame();
   for (let it = 0; it < iterations; it++) {
     for (let i = 0; i < entities.length; i++) {
       const a = entities[i];

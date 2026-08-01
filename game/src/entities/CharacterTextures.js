@@ -62,6 +62,13 @@ function safeAO(height, size, radius, strength) {
   return null;
 }
 
+function safeCavity(height, size, radius, strength) {
+  if (height && has('heightToCavity')) {
+    try { return TextureGen.heightToCavity(height, size, radius, strength); } catch { /* fall through */ }
+  }
+  return null;
+}
+
 function safeTexture(canvas, opts) {
   if (canvas && has('toTexture')) {
     try { return TextureGen.toTexture(canvas, opts); } catch { /* fall through */ }
@@ -69,7 +76,16 @@ function safeTexture(canvas, opts) {
   return null;
 }
 
-/** Brushed steel with scratch wear, dents, and darker recesses. */
+/**
+ * Brushed steel with scratch wear, dents, and darker recesses.
+ *
+ * "Edge wear" is a cavity-driven effect: `heightToCavity` finds pits relative
+ * to the local neighbourhood, which is exactly where oxide/grime collects and,
+ * by inverse, exactly where the *raised* brushed ridges get polished bright by
+ * handling and combat. Albedo brightens and roughness drops on the raised
+ * strokes; both darken/roughen in the cavities. That contrast is what reads as
+ * "worn plate" instead of a uniform grey metal swatch.
+ */
 function buildMetalMaps(seed, size = 256) {
   const noise = safeNoise(seed);
   const height = safeHeight(size, (u, v) => {
@@ -80,15 +96,20 @@ function buildMetalMaps(seed, size = 256) {
   });
   const normal = safeNormal(height, size, 1.4);
   const ao = safeAO(height, size, 4, 0.6);
+  const cavity = safeCavity(height, size, 3, 1.3);
   const albedo = safeImage(size, (u, v, x, y) => {
     const h = height ? height[y * size + x] : 0;
-    const wear = Math.max(0, h) * 0.5;
-    const base = 0.62 + wear;
-    return [base, base * 0.99, base * 0.95];
+    const cav = cavity ? cavity[y * size + x] : 0;
+    const edgeWear = Math.max(0, h) * 0.55;   // raised brush strokes catch a bright polish
+    const grime = cav * 0.30;                 // recesses collect soot and oxide
+    const base = 0.60 + edgeWear - grime;
+    return [base, base * 0.99, base * 0.94 - grime * 0.05];
   });
   const rough = safeImage(size, (u, v, x, y) => {
     const h = height ? height[y * size + x] : 0;
-    const r = THREE.MathUtils.clamp(0.36 - h * 0.30, 0.08, 0.7);
+    const cav = cavity ? cavity[y * size + x] : 0;
+    // Worn highlights are polished (low roughness); pits and grime are matte.
+    const r = THREE.MathUtils.clamp(0.28 - h * 0.24 + cav * 0.38, 0.05, 0.75);
     return [r, r, r];
   });
   return {
@@ -139,9 +160,92 @@ function buildBoneMaps(seed, size = 192) {
     const base = 0.72 - stain * 0.14;
     return [base, base * 0.96, base * 0.86];
   });
+  // A faint waxy sheen on the smoother ridges, roughened in the porous pits --
+  // enough variance to read as "subtle sheen", never mirror-bright like metal.
+  const rough = safeImage(size, (u, v, x, y) => {
+    const h = height ? height[y * size + x] : 0;
+    const r = THREE.MathUtils.clamp(0.58 - h * 0.22, 0.4, 0.85);
+    return [r, r, r];
+  });
   return {
     map: safeTexture(albedo, { srgb: true, repeat: 1 }),
     normalMap: safeTexture(normal, { repeat: 1 }),
+    roughnessMap: safeTexture(rough, { repeat: 1 }),
+    aoMap: safeTexture(ao, { repeat: 1 }),
+  };
+}
+
+/** Tanned leather: grain, pores, and creases -- straps, belts, gambesons. */
+function buildLeatherMaps(seed, size = 256) {
+  const noise = safeNoise(seed);
+  const height = safeHeight(size, (u, v) => {
+    const grain = safeFbm(noise, u * 10 + 1, v * 10 + 4, { octaves: 4, basePeriod: 14 }) * 0.35;
+    const pores = Math.pow(safeWorley(u, v, 22, 53).f1, 3) * 0.4;
+    const creases = Math.pow(safeFbm(noise, u * 3 + 9, v * 3 + 2, { octaves: 3, basePeriod: 5 }), 4) * 0.5;
+    return grain - pores - creases;
+  });
+  const normal = safeNormal(height, size, 1.0);
+  const ao = safeAO(height, size, 3, 0.55);
+  const albedo = safeImage(size, (u, v, x, y) => {
+    const h = height ? height[y * size + x] : 0;
+    const base = 0.55 + h * 0.30;
+    return [base, base * 0.80, base * 0.58];
+  });
+  const rough = safeImage(size, (u, v, x, y) => {
+    const h = height ? height[y * size + x] : 0;
+    return [THREE.MathUtils.clamp(0.68 - h * 0.14, 0.45, 0.85)];
+  });
+  return {
+    map: safeTexture(albedo, { srgb: true, repeat: 1 }),
+    normalMap: safeTexture(normal, { repeat: 1 }),
+    roughnessMap: safeTexture(rough, { repeat: 1 }),
+    aoMap: safeTexture(ao, { repeat: 1 }),
+  };
+}
+
+/** Skin: very low-amplitude pore/blemish variation -- must stay subtle. */
+function buildSkinMaps(seed, size = 192) {
+  const noise = safeNoise(seed);
+  const height = safeHeight(size, (u, v) => {
+    const pores = Math.pow(safeWorley(u, v, 34, 17).f1, 4) * -0.20;
+    const soft = (safeFbm(noise, u * 2 + 5, v * 2 + 8, { octaves: 3, basePeriod: 4 }) - 0.5) * 0.16;
+    return pores + soft;
+  });
+  const normal = safeNormal(height, size, 0.45);
+  const ao = safeAO(height, size, 2, 0.28);
+  const albedo = safeImage(size, (u, v, x, y) => {
+    const h = height ? height[y * size + x] : 0;
+    const flush = safeFbm(noise, u * 1.5 + 3, v * 1.5 + 6, { octaves: 3, basePeriod: 3 });
+    const base = 0.82 + h * 0.5;
+    return [base, base * 0.86 + flush * 0.05, base * 0.78];
+  });
+  return {
+    map: safeTexture(albedo, { srgb: true, repeat: 1 }),
+    normalMap: safeTexture(normal, { repeat: 1 }),
+    aoMap: safeTexture(ao, { repeat: 1 }),
+  };
+}
+
+/** Dyed cloth/leather trim for accent bands, tabard fields, cloak lining. */
+function buildAccentMaps(seed, size = 192) {
+  const noise = safeNoise(seed);
+  const height = safeHeight(size, (u, v) => {
+    const weave = Math.sin(u * 100) * Math.sin(v * 100) * 0.10;
+    const wear = safeFbm(noise, u * 3 + 2, v * 3 + 7, { octaves: 4, basePeriod: 6 }) * 0.30;
+    return weave + wear;
+  });
+  const normal = safeNormal(height, size, 0.85);
+  const ao = safeAO(height, size, 3, 0.5);
+  const albedo = safeImage(size, (u, v, x, y) => {
+    const h = height ? height[y * size + x] : 0;
+    const base = 0.60 + h * 0.32;
+    return [base, base * 0.92, base * 0.86];
+  });
+  const rough = safeImage(size, () => [0.78, 0.78, 0.78]);
+  return {
+    map: safeTexture(albedo, { srgb: true, repeat: 1 }),
+    normalMap: safeTexture(normal, { repeat: 1 }),
+    roughnessMap: safeTexture(rough, { repeat: 1 }),
     aoMap: safeTexture(ao, { repeat: 1 }),
   };
 }
@@ -157,3 +261,6 @@ function cached(key, build) {
 export function metalMaps(seed = 1) { return cached(`metal:${seed}`, () => buildMetalMaps(seed)); }
 export function clothMaps(seed = 1) { return cached(`cloth:${seed}`, () => buildClothMaps(seed)); }
 export function boneMaps(seed = 1) { return cached(`bone:${seed}`, () => buildBoneMaps(seed)); }
+export function leatherMaps(seed = 1) { return cached(`leather:${seed}`, () => buildLeatherMaps(seed)); }
+export function skinMaps(seed = 1) { return cached(`skin:${seed}`, () => buildSkinMaps(seed)); }
+export function accentMaps(seed = 1) { return cached(`accent:${seed}`, () => buildAccentMaps(seed)); }

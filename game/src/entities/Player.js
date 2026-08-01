@@ -23,6 +23,9 @@ export class Player extends Entity {
       acceleration: 42,
       friction: 34,
       maxHealth: 220,
+      armor: 5,
+      critChance: 0.12,
+      critMultiplier: 2.0,
       ...opts,
     });
 
@@ -80,10 +83,32 @@ export class Player extends Entity {
     return this.alive && this.attackCooldown <= 0 && !this.animator.busy && this.stunTimer <= 0;
   }
 
+  /**
+   * Attack lunge: a target sitting just past comfortable range still gets
+   * closed on and hit, rather than the swing whiffing or the order silently
+   * refusing. Combat readability lives and dies on this -- a click that
+   * visibly doesn't connect reads as broken input, not as "out of range".
+   * This is a direct, decaying velocity nudge (reuses the knockback impulse
+   * channel) rather than a teleport, so it still looks like a real step.
+   */
+  _lungeToward(target) {
+    if (!target || !target.alive) return;
+    const d = this.distanceTo(target);
+    const gap = d - this.attackRange * 0.55;
+    if (gap <= 0) return;
+    const lunge = Math.min(gap, this.attackRange * 0.55);
+    const dx = target.position.x - this.position.x;
+    const dz = target.position.z - this.position.z;
+    const len = Math.hypot(dx, dz) || 1;
+    this.knockback.x += (dx / len) * lunge * 9;
+    this.knockback.z += (dz / len) * lunge * 9;
+  }
+
   /** @param onImpact called at the frame the blade should connect */
   attack(onImpact) {
     if (!this.canAttack()) return false;
     this.attackCooldown = this.attackDuration * 0.92;
+    this._lungeToward(this.target);
     this.animator.play('attackSwing', this.attackDuration, {
       events: [{ at: 0.42, name: 'impact' }, { at: 0.30, name: 'whoosh' }],
       onEvent: (name) => onImpact?.(name),

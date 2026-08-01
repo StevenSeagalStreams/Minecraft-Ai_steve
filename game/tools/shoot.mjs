@@ -228,6 +228,12 @@ async function main() {
       throw new Error(`game never became ready.\nbootError: ${bootErr}\nconsole:\n${logs.join('\n')}`);
     }
 
+    // The boot overlay fades on a CSS transition. Under SwiftShader that
+    // transition can be starved, and a captured frame then shows the splash
+    // instead of the game -- which silently poisons every critic grade. Remove
+    // the element outright rather than trusting the animation to have finished.
+    await page.evaluate(() => document.getElementById('boot')?.remove());
+
     // Let the first frames render and shaders warm before any capture.
     await settle(page, 1.5);
 
