@@ -253,7 +253,11 @@ class Game {
     this._updateDebug(dt);
 
     this.renderer.info.reset();
-    this.postfx.render(dt);
+    // Diagnostic bypass: render the scene straight to the screen, skipping the
+    // whole composer chain. Lets the probe attribute a crushed frame to the
+    // post stack versus the scene itself in one measurement.
+    if (this.__nopost) this.renderer.render(this.scene, this.camera);
+    else this.postfx.render(dt);
     this.input.endFrame();
   }
 

@@ -79,6 +79,14 @@ try {
    * not arriving" to a specific stage, which is otherwise many slow guesses.
    */
   if (args.experiment) {
+    // The HUD is DOM, not scene. At 320x180 the health/mana orbs alone are a
+    // big share of the frame, and their constant brightness masked every
+    // lighting change in the first run of this experiment.
+    await page.evaluate(() => {
+      const ui = document.getElementById('ui-root');
+      if (ui) ui.style.display = 'none';
+    });
+
     const measure = async (label, mutate) => {
       await page.evaluate(([m]) => {
         const g = window.__game;
@@ -108,13 +116,20 @@ try {
         const ctx = c.getContext('2d', { willReadFrequently: true });
         ctx.drawImage(img, 0, 0, c.width, c.height);
         const d = ctx.getImageData(0, 0, c.width, c.height).data;
-        let s = 0, n = 0;
+        const ls = [];
+        let s = 0;
         for (let i = 0; i < d.length; i += 4) {
-          s += (0.2126 * d[i] + 0.7152 * d[i + 1] + 0.0722 * d[i + 2]) / 255; n++;
+          const l = (0.2126 * d[i] + 0.7152 * d[i + 1] + 0.0722 * d[i + 2]) / 255;
+          ls.push(l); s += l;
         }
-        return +(s / n).toFixed(4);
+        ls.sort((a, b) => a - b);
+        return {
+          mean: +(s / ls.length).toFixed(4),
+          p50: +ls[Math.floor(ls.length * 0.5)].toFixed(4),
+          p95: +ls[Math.floor(ls.length * 0.95)].toFixed(4),
+        };
       }, b64);
-      console.log(`  ${label.padEnd(46)} meanLuma=${luma}`);
+      console.log(`  ${label.padEnd(40)} mean=${String(luma.mean).padEnd(8)} p50=${String(luma.p50).padEnd(8)} p95=${luma.p95}`);
     };
 
     console.log('\n=== light ablation (mean luma per variant) ===');
@@ -125,6 +140,14 @@ try {
       g.scene.traverse(o => { if (o.isDirectionalLight) o.visible = false; });`);
     await measure('ambient+hemi OFF (sun only)', `
       g.scene.traverse(o => { if (o.isAmbientLight || o.isHemisphereLight) o.visible = false; });`);
+
+    // Nothing about the lights moves the frame, so the crush must live after
+    // them. Walk the post chain one pass at a time.
+    await measure('GTAO pass disabled', 'if (g.postfx?.gtao) g.postfx.gtao.enabled = false;');
+    await measure('vignette off', 'if (g.postfx?.grade) g.postfx.grade.uniforms.vignette.value = 4.0;');
+    await measure('grade exposure x4', 'if (g.postfx?.grade) g.postfx.grade.uniforms.exposure.value *= 4;');
+    await measure('BLOOM disabled', 'if (g.postfx?.bloom) g.postfx.bloom.enabled = false;');
+    await measure('NO POST (direct render)', 'g.__nopost = true;');
     console.log('');
   }
 
