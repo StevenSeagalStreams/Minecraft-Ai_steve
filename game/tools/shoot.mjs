@@ -124,6 +124,11 @@ const SHOTS = {
 
   /** Close on the character, to judge model and material quality. */
   hero: { type: 'ground', run: async (page) => {
+    // Frame on content like wide/vista do. Without this the close shot lands
+    // wherever the player spawned -- which for the forest is a rock bowl with
+    // no treeline in it, so every close-range judgement was made against a
+    // part of the level that does not represent it.
+    await frameContent(page);
     await page.evaluate(() => {
       const g = window.__game;
       g.rig.distance = 13;
