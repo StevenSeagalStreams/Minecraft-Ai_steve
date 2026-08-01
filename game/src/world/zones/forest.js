@@ -1,9 +1,11 @@
 import * as THREE from 'three';
 import { NavGrid } from '../Nav.js';
-import { TILE } from '../LevelBuilder.js';
+import { Terrain } from '../TerrainGen.js';
+import { buildForestFoliage, buildUndergrowth } from '../Foliage.js';
+import { buildForestDressing } from '../Props.js';
 
 /**
- * Zone 1 -- the Blighted Forest.  *** M1 TARGET ZONE ***
+ * Zone 1 -- the Blighted Forest. *** M1 TARGET ZONE ***
  *
  * The WoW pillar lives here: a readable outdoor space with strong zone
  * identity, silhouette-driven treelines, and a low sun that rakes across
@@ -20,62 +22,67 @@ import { TILE } from '../LevelBuilder.js';
  *   - Blight: dead bark, curled leaves, ash drift, sickly fungal accents as
  *     the single saturated colour note.
  *
- * STUB -- owned and implemented by the Terrain & Environment agent.
- * The contract below is what the game loop consumes; keep these fields.
+ * Layout: a single worn trail climbs from the south trailhead (spawn, an old
+ * reclaimed fence line) through a boggy hollow and a ridge saddle to a fork
+ * at the Dead Great-Tree clearing -- the landmark visible from spawn. From
+ * the fork, one branch reaches a standing-stone shrine (secondary landmark,
+ * the bioluminescent-fungus focal point); the other peters into a thicket
+ * against the sealed treeline boundary.
  */
 export async function createForest(ctx) {
-  const { scene, rng } = ctx;
+  const { scene } = ctx;
+  const rng = ctx.rng;
 
   const group = new THREE.Group();
   group.name = 'Zone:forest';
 
-  // Placeholder flat ground so the game still boots before the terrain pass
-  // lands. The Terrain agent replaces everything in this function.
-  const SIZE = 96;
-  const ground = new THREE.Mesh(
-    new THREE.PlaneGeometry(SIZE * TILE, SIZE * TILE, 1, 1),
-    ctx.materials?.floor || new THREE.MeshStandardMaterial({ color: 0x2c3326, roughness: 1 })
-  );
-  ground.rotation.x = -Math.PI / 2;
-  ground.position.set((SIZE * TILE) / 2, 0, (SIZE * TILE) / 2);
-  ground.receiveShadow = true;
-  group.add(ground);
+  const SIZE = 96; // collision-grid cells; must match TILE spacing (2m)
+  const TILE_SIZE = 2.0;
 
-  // Open navigation grid over the whole area.
-  const solid = new Uint8Array(SIZE * SIZE);
-  const colliders = {
-    width: SIZE,
-    height: SIZE,
-    solid,
-    isSolidCell: (x, y) => x < 0 || y < 0 || x >= SIZE || y >= SIZE || solid[y * SIZE + x] === 1,
-    isBlocked(wx, wz, radius = 0.45) {
-      const minX = Math.round((wx - radius) / TILE);
-      const maxX = Math.round((wx + radius) / TILE);
-      const minY = Math.round((wz - radius) / TILE);
-      const maxY = Math.round((wz + radius) / TILE);
-      for (let y = minY; y <= maxY; y++) {
-        for (let x = minX; x <= maxX; x++) {
-          if (this.isSolidCell(x, y)) {
-            const cx = x * TILE, cy = y * TILE;
-            const nx = Math.max(cx - TILE / 2, Math.min(wx, cx + TILE / 2));
-            const ny = Math.max(cy - TILE / 2, Math.min(wz, cy + TILE / 2));
-            const dx = wx - nx, dy = wz - ny;
-            if (dx * dx + dy * dy < radius * radius) return true;
-          }
-        }
-      }
-      return false;
-    },
-  };
+  // -- terrain: heightfield, splat-blended mesh, matching collision grid ----
+  const terrain = new Terrain(rng.fork('terrain'), { size: SIZE, tile: TILE_SIZE });
+  const terrainMesh = terrain.buildMesh(ctx.materials);
+  group.add(terrainMesh);
+  const colliders = terrain.buildColliders();
+  const nav = new NavGrid(colliders);
 
-  const centre = (SIZE * TILE) / 2;
+  // Sky is the Lighting agent's responsibility (src/render/Sky.js, installed
+  // by Lighting.applyRig from lightRig below) -- not built here, so it can
+  // never drift from the directional sun's actual position.
+
+  // -- treelines: silhouette-mass trees, instanced ---------------------------
+  const foliage = buildForestFoliage({ rng: rng.fork('foliage'), terrain });
+  group.add(foliage.group);
+
+  // -- undergrowth: ferns, tufts, shrubs, logs, roots ------------------------
+  const undergrowth = buildUndergrowth({ rng: rng.fork('undergrowth'), terrain });
+  group.add(undergrowth.group);
+
+  // -- dressing: rocks, bones, the reclaimed fence, the shrine, blight glow --
+  const dressing = buildForestDressing({ rng: rng.fork('dressing'), materials: ctx.materials, terrain });
+  group.add(dressing.group);
+
+  // -- spawn point: the trailhead, on the authored path ----------------------
+  const entry = terrain.path.entry;
+  const spawnPoint = new THREE.Vector3(entry.x, terrain.heightAt(entry.x, entry.z), entry.z);
+
+  // -- monster spawns: scattered through the reachable interior, away from
+  // the immediate trailhead -------------------------------------------------
+  const spawnRng = rng.fork('spawns');
   const spawns = [];
   for (let i = 0; i < 14; i++) {
-    const a = rng.range(0, Math.PI * 2);
-    const r = rng.range(10, 34);
+    let pos = null;
+    for (let attempt = 0; attempt < 60; attempt++) {
+      const wx = spawnRng.range(terrain.worldSize * 0.14, terrain.worldSize * 0.86);
+      const wz = spawnRng.range(terrain.worldSize * 0.14, terrain.worldSize * 0.86);
+      if (colliders.isBlocked(wx, wz, 1.0)) continue;
+      if (Math.hypot(wx - spawnPoint.x, wz - spawnPoint.z) < 9) continue;
+      pos = new THREE.Vector3(wx, terrain.heightAt(wx, wz), wz);
+      break;
+    }
     spawns.push({
-      kind: rng.bool(0.5) ? 'swarmer' : 'skeleton',
-      position: new THREE.Vector3(centre + Math.sin(a) * r, 0, centre + Math.cos(a) * r),
+      kind: spawnRng.bool(0.5) ? 'swarmer' : 'skeleton',
+      position: pos || spawnPoint.clone(),
     });
   }
 
@@ -85,10 +92,12 @@ export async function createForest(ctx) {
     name: 'forest',
     group,
     colliders,
-    nav: new NavGrid(colliders),
+    nav,
+    terrain,
     spawns,
-    spawnPoint: new THREE.Vector3(centre, 0, centre),
-    bounds: { minX: 0, maxX: SIZE * TILE, minZ: 0, maxZ: SIZE * TILE },
+    spawnPoint,
+    bounds: { minX: 0, maxX: terrain.worldSize, minZ: 0, maxZ: terrain.worldSize },
+    drawCalls: terrain.drawCalls + foliage.drawCalls + undergrowth.drawCalls + dressing.drawCalls,
     // Sick amber-and-slate exterior: desaturated, cold shadows, warm low sun.
     fog: { color: 0x39423f, density: 0.0075 },
     grade: {
@@ -110,6 +119,8 @@ export async function createForest(ctx) {
       hemiGround: 0x241f18,
       hemiIntensity: 0.75,
     },
-    update(_dt) {},
+    update(dt) {
+      dressing.update?.(dt);
+    },
   };
 }

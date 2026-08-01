@@ -156,19 +156,26 @@ export class PostFX {
     // GTAO's own g-buffer prepass (depth + view-space normals) is reused by
     // the Volumetrics pass below for height fog, so outdoor zones do not pay
     // for a second full-scene depth render.
+    //
+    // screenSpaceRadius:true keeps the AO kernel a constant *pixel* footprint
+    // rather than a fixed world-space radius. A fixed world-space radius over
+    // a huge, nearly coplanar outdoor ground plane viewed from far away (a
+    // survey/establishing shot) subtends a wildly different number of samples
+    // than it does close-up, and on this engine's flat placeholder terrain
+    // that mismatch was crushing the whole far shot toward black -- a screen-
+    // space radius degrades gracefully with distance instead.
     this.gtao = new GTAOPass(scene, camera, size.x, size.y);
     this.gtao.output = GTAOPass.OUTPUT.Default;
-    this.gtao.blendIntensity = 1.0;
+    this.gtao.blendIntensity = 0.8;
     this.gtao.updateGtaoMaterial({
-      radius: 0.62,
-      distanceExponent: 1.3,
-      thickness: 0.7,
+      radius: 0.5,
+      distanceExponent: 1.6,
+      thickness: 0.55,
       scale: 1.0,
-      samples: 24,
+      samples: 16,
       distanceFallOff: 1.0,
-      screenSpaceRadius: false,
+      screenSpaceRadius: true,
     });
-    this.gtao.updatePdMaterial({ lumaPhi: 8, depthPhi: 3, normalPhi: 6, radius: 5, radiusExponent: 1.8, rings: 3, samples: 12 });
     this.gtao.enabled = quality.ssao !== false;
     this.composer.addPass(this.gtao);
 

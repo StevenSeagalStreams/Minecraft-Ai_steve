@@ -99,7 +99,9 @@ const VolumetricsShader = {
         float dist = distance(wp, cameraPos);
         float below = max(fogHeight - wp.y, 0.0);
         float amount = 1.0 - exp(-below * fogFalloff - dist * fogDensity);
-        amount = clamp(amount, 0.0, 0.92);
+        // Capped well under 1.0: this is a pooling accent on top of the
+        // scene's own distance fog, never a second full whiteout layer.
+        amount = clamp(amount, 0.0, 0.6);
         color = mix(color, fogColor, amount);
       }
 

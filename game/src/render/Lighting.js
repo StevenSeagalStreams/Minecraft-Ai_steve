@@ -205,15 +205,29 @@ export class Lighting {
     ).normalize();
 
     this._sunDistance = rig.sunDistance ?? 220;
-    this.shadowFocusRadius = rig.shadowFocusRadius ?? 42;
-    // Fixing peter-panning/acne on a low-angle light over uneven terrain
-    // needs more bias than an overhead light would: normalBias does the bulk
-    // of the work (it offsets the shadow lookup along the surface normal, so
-    // it scales correctly across the whole raking-angle range), bias is kept
-    // small so contact points don't visibly detach.
-    this.sun.shadow.bias = rig.shadowBias ?? -0.00055;
-    this.sun.shadow.normalBias = rig.shadowNormalBias ?? 0.09;
-    this.sun.shadow.radius = 2.2;
+    // Tighter than the old static 34-unit box: better texel density, and it
+    // gets re-centred on the camera focus every frame anyway (see
+    // _fitSunShadow), so there is no coverage cost to shrinking it.
+    this.shadowFocusRadius = rig.shadowFocusRadius ?? 28;
+
+    // Fixing peter-panning/acne on a *low-angle* light over a large flat
+    // surface needs far more slope bias than an overhead light would: the
+    // shadow-map texel footprint (2*shadowFocusRadius / shadowSize, in world
+    // units) projected along a shallow incidence angle can be many times
+    // larger than the texel itself, so a fixed normalBias tuned for an
+    // overhead dungeon light (0.035-0.09) reads as fine self-shadowing
+    // stripes across every raking surface -- exactly the "acne band" defect.
+    // Derive it from the actual geometry instead of a magic constant: the
+    // offset needed along the surface normal to escape self-shadowing scales
+    // with texelSize / tan(elevation).
+    const elevRad = THREE.MathUtils.degToRad(rig.sunElevation ?? 45);
+    const texelWorld = (this.shadowFocusRadius * 2) / this.shadowSize;
+    const autoNormalBias = THREE.MathUtils.clamp(
+      texelWorld / Math.max(Math.tan(elevRad), 0.06), 0.03, 0.6
+    );
+    this.sun.shadow.bias = rig.shadowBias ?? -0.00045;
+    this.sun.shadow.normalBias = rig.shadowNormalBias ?? autoNormalBias;
+    this.sun.shadow.radius = 2.0;
     this.sun.shadow.camera.far = this._sunDistance * 2.4;
 
     // Frame it immediately so the very first rendered frame (before update()
@@ -289,9 +303,14 @@ export class Lighting {
       skyMesh: this.sky && rig.sky !== false ? this.sky.mesh : null,
       fog: {
         color: rig.groundFogColor ?? this._sceneFogColor() ?? 0x39423f,
-        height: rig.groundFogHeight ?? 2.5,
-        falloff: rig.groundFogFalloff ?? 0.12,
-        density: rig.groundFogDensity ?? fogDensityBase * 4,
+        // Low + gentle by default: this is a *pooling* effect for terrain
+        // hollows, not a second uniform haze on top of scene.fog. A flat
+        // placeholder ground sitting at y=0 should only pick up a light skim
+        // from this, not get crushed toward fogColor -- real hollows that
+        // dip below groundFogHeight are what should read as pooled.
+        height: rig.groundFogHeight ?? 1.2,
+        falloff: rig.groundFogFalloff ?? 0.05,
+        density: rig.groundFogDensity ?? fogDensityBase * 1.2,
       },
     };
   }
@@ -340,16 +359,17 @@ export class Lighting {
     }
   }
 
+  /** Distance FogExp2 only. Deliberately does not touch the height-fog pass
+   *  (scene.userData.envLight.fog) -- that is a separate, gentler pooling
+   *  effect set once from the rig, and callers reaching for "less fog" for a
+   *  moment (e.g. the survey camera) should not also fight ground-hollow
+   *  pooling. Use `setGroundFogDensity` for that. */
   setFogDensity(d) {
     if (this.scene.fog) this.scene.fog.density = d;
-    if (this.scene.userData.envLight) {
-      // Keep the height-fog pass's horizontal term roughly in step with the
-      // zone's distance fog unless a rig explicitly overrode it.
-      const rig = this.rig || {};
-      if (rig.groundFogDensity === undefined) {
-        this.scene.userData.envLight.fog.density = d * 4;
-      }
-    }
+  }
+
+  setGroundFogDensity(d) {
+    if (this.scene.userData.envLight) this.scene.userData.envLight.fog.density = d;
   }
 
   update(dt, focus) {
