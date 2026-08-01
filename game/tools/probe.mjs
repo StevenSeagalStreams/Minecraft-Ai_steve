@@ -73,6 +73,67 @@ try {
   await page.waitForFunction(() => window.__ready === true, { timeout: 240000 });
   await page.waitForTimeout(2500);
 
+  /**
+   * Ablation mode. Renders the same frame under a series of single-variable
+   * mutations and reports mean luma for each. One run localises "the light is
+   * not arriving" to a specific stage, which is otherwise many slow guesses.
+   */
+  if (args.experiment) {
+    const measure = async (label, mutate) => {
+      await page.evaluate(([m]) => {
+        const g = window.__game;
+        // Restore from the snapshot taken on the first call so each variant is
+        // a single change against baseline, never cumulative.
+        if (!window.__snap) {
+          window.__snap = [];
+          g.scene.traverse((o) => {
+            if (o.isLight) window.__snap.push({ o, i: o.intensity, v: o.visible, cs: o.castShadow });
+          });
+          window.__snapExp = g.postfx?.grade?.uniforms?.exposure?.value;
+        }
+        for (const s of window.__snap) { s.o.intensity = s.i; s.o.visible = s.v; s.o.castShadow = s.cs; }
+        if (g.postfx?.grade) g.postfx.grade.uniforms.exposure.value = window.__snapExp;
+        // eslint-disable-next-line no-eval
+        eval(m);
+      }, [mutate]);
+      await page.waitForTimeout(1200);
+      const buf = await page.screenshot({ type: 'png' });
+      const b64 = buf.toString('base64');
+      const luma = await page.evaluate(async (data) => {
+        const img = new Image();
+        img.src = 'data:image/png;base64,' + data;
+        await img.decode();
+        const c = document.createElement('canvas');
+        c.width = 240; c.height = Math.round((img.height / img.width) * 240);
+        const ctx = c.getContext('2d', { willReadFrequently: true });
+        ctx.drawImage(img, 0, 0, c.width, c.height);
+        const d = ctx.getImageData(0, 0, c.width, c.height).data;
+        let s = 0, n = 0;
+        for (let i = 0; i < d.length; i += 4) {
+          s += (0.2126 * d[i] + 0.7152 * d[i + 1] + 0.0722 * d[i + 2]) / 255; n++;
+        }
+        return +(s / n).toFixed(4);
+      }, b64);
+      console.log(`  ${label.padEnd(46)} meanLuma=${luma}`);
+    };
+
+    console.log('\n=== light ablation (mean luma per variant) ===');
+    await measure('baseline (as shipped)', 'void 0');
+    await measure('sun.castShadow = false', `
+      g.scene.traverse(o => { if (o.isDirectionalLight && o.intensity > 1) o.castShadow = false; });`);
+    await measure('sun intensity x6', `
+      g.scene.traverse(o => { if (o.isDirectionalLight && o.intensity > 1) o.intensity *= 6; });`);
+    await measure('sun OFF (ambient+hemi only)', `
+      g.scene.traverse(o => { if (o.isDirectionalLight) o.visible = false; });`);
+    await measure('ambient+hemi OFF (sun only)', `
+      g.scene.traverse(o => { if (o.isAmbientLight || o.isHemisphereLight) o.visible = false; });`);
+    await measure('grade exposure x4', `
+      if (g.postfx?.grade) g.postfx.grade.uniforms.exposure.value *= 4;`);
+    await measure('ALL shadows off', `
+      g.scene.traverse(o => { if (o.isLight) o.castShadow = false; });`);
+    console.log('');
+  }
+
   const report = await page.evaluate(() => {
     const g = window.__game;
     const THREE = g.THREE || null;
