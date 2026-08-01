@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import {
   makeValueNoise, fbm, ridgedFbm, domainWarp, worley, smoothstep,
+  generateHeight, generateImage, heightToNormal, toTexture,
 } from '../render/TextureGen.js';
 
 /**
@@ -236,15 +237,20 @@ export class Terrain {
       return materials?.floor || new THREE.MeshStandardMaterial({ color: 0x2c3326, roughness: 1 });
     };
 
-    const grassBase = pick('deadGrass', 'grass', 'roughRock', 'floor').clone();
-    tuneLayer(grassBase, { tint: 0x828a5e, roughBoost: 0.06 });
-    applyWorldSpaceUV(grassBase, 0.11);
+    // Synthesized directly (not `pick()`ed from the material library, which
+    // has no grass/mud recipe and was silently falling back to roughRock's
+    // cracked-cavity relief -- a tinted rock texture still reads as rock).
+    // See buildDeadGrassMaterial/buildDampSoilMaterial above.
+    const grassSeed = this.rng.int32 ? this.rng.int32() : 0xa17c3;
+    const grassBase = buildDeadGrassMaterial(grassSeed, 256);
+    grassBase.envMapIntensity = 0.32;
+    applyWorldSpaceUV(grassBase, 0.13);
     grassBase.transparent = false;
     grassBase.depthWrite = true;
 
-    const mudMat = pick('mud', 'silt', 'mossWall', 'floor').clone();
-    tuneLayer(mudMat, { tint: 0x46402c, roughBoost: -0.12 });
-    applyWorldSpaceUV(mudMat, 0.09);
+    const mudMat = buildDampSoilMaterial(grassSeed ^ 0x5bd1e995, 256);
+    mudMat.envMapIntensity = 0.32;
+    applyWorldSpaceUV(mudMat, 0.1);
     applyWeightAlpha(mudMat, 'aMud', 1);
 
     const pathMat = pick('dirt', 'path', 'floor').clone();
@@ -345,6 +351,84 @@ export class Terrain {
       }
     }
   }
+}
+
+/**
+ * Ground base layer, synthesized directly from TextureGen's noise/height
+ * pipeline rather than picked from the material library. The library has no
+ * `deadGrass`/`grass` recipe, so `pick('deadGrass', 'grass', 'roughRock',
+ * 'floor')` was silently resolving to `roughRock` -- a cracked-cavity rock
+ * height field -- for the layer that covers most of the frame. Tinting that
+ * green doesn't change what it *is*: a cracked-stone relief pattern, which is
+ * exactly what read as "canyon / dry wash / desert hardpan" instead of forest
+ * floor. This builds a patchy dead-grass-over-dirt relief (worley tufts +
+ * fbm clumping, no crack network) so the base layer's *geometry*, not just
+ * its color, says grass rather than rock.
+ */
+function buildDeadGrassMaterial(seed, size = 256) {
+  const noiseA = makeValueNoise(seed >>> 0);
+  const noiseB = makeValueNoise((seed ^ 0x2545f491) >>> 0);
+  const height = generateHeight(size, (u, v) => {
+    const clump = fbm(noiseA, u * 5 + 2, v * 5 + 7, { octaves: 4, basePeriod: 5 });
+    const { f1 } = worley(u * 9 + 3, v * 9 + 11, 7, 4021);
+    const tuft = 1 - Math.min(1, f1 * 1.7);
+    const fine = fbm(noiseB, u * 24 + 9, v * 24 + 2, { octaves: 3, basePeriod: 20 }) - 0.5;
+    return clump * 0.55 + tuft * 0.32 + fine * 0.13;
+  });
+  const albedo = generateImage(size, (u, v, x, y) => {
+    const h = height[y * size + x];
+    const patchy = fbm(noiseB, u * 4 + 20, v * 4 + 8, { octaves: 3, basePeriod: 4 });
+    const t = THREE.MathUtils.clamp(h + 0.5, 0, 1);
+    // Dead straw over damp dirt, with sparse dull-green survivor tufts in
+    // the raised clumps -- never a uniform lawn, never bare rock.
+    let r = THREE.MathUtils.lerp(0.20, 0.42, t);
+    let g = THREE.MathUtils.lerp(0.18, 0.38, t);
+    let b = THREE.MathUtils.lerp(0.13, 0.24, t);
+    const greenAmt = smoothstep(patchy, 0.6, 0.82) * 0.55;
+    r = THREE.MathUtils.lerp(r, 0.27, greenAmt);
+    g = THREE.MathUtils.lerp(g, 0.32, greenAmt);
+    b = THREE.MathUtils.lerp(b, 0.18, greenAmt);
+    const speck = fbm(noiseA, u * 40 + 3, v * 40 + 9, { octaves: 2, basePeriod: 40 });
+    const litter = smoothstep(speck, 0.72, 0.85) * 0.18; // dark leaf-litter flecks
+    const shade = (0.82 + h * 0.32) * (1 - litter);
+    return [r * shade, g * shade, b * shade, 1];
+  });
+  const normalCanvas = heightToNormal(height, size, 1.3);
+  return new THREE.MeshStandardMaterial({
+    map: toTexture(albedo, { srgb: true, repeat: 1 }),
+    normalMap: toTexture(normalCanvas, { srgb: false, repeat: 1 }),
+    roughness: 0.96,
+    metalness: 0,
+  });
+}
+
+/** Damp-soil replacement for the mud layer -- soft clod relief rather than
+ * the rock library's cavity network, matching the critic's "needs ... damp
+ * soil" note. */
+function buildDampSoilMaterial(seed, size = 256) {
+  const noiseA = makeValueNoise(seed >>> 0);
+  const height = generateHeight(size, (u, v) => {
+    const base = fbm(noiseA, u * 4 + 11, v * 4 + 3, { octaves: 4, basePeriod: 4 });
+    const { f1 } = worley(u * 6 + 1, v * 6 + 9, 5, 913);
+    const clod = 1 - Math.min(1, f1 * 1.4);
+    return base * 0.6 + clod * 0.4;
+  });
+  const albedo = generateImage(size, (u, v, x, y) => {
+    const h = height[y * size + x];
+    const t = THREE.MathUtils.clamp(h + 0.5, 0, 1);
+    const r = THREE.MathUtils.lerp(0.10, 0.20, t);
+    const g = THREE.MathUtils.lerp(0.09, 0.17, t);
+    const b = THREE.MathUtils.lerp(0.07, 0.13, t);
+    const shade = 0.85 + h * 0.3;
+    return [r * shade, g * shade, b * shade, 1];
+  });
+  const normalCanvas = heightToNormal(height, size, 1.6);
+  return new THREE.MeshStandardMaterial({
+    map: toTexture(albedo, { srgb: true, repeat: 1 }),
+    normalMap: toTexture(normalCanvas, { srgb: false, repeat: 1 }),
+    roughness: 0.7,
+    metalness: 0,
+  });
 }
 
 function tuneLayer(mat, { tint, roughBoost = 0 }) {

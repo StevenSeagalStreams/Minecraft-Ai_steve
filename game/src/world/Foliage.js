@@ -109,12 +109,20 @@ function treeDensityAt(terrain, wx, wz, pathDist) {
   const clump = hashNoise(u * 3.0 + 11, v * 3.0 + 4);
   const thicket = smoothstep(clump, 0.5, 0.7);
   const fine = hashNoise(u * 9.3 + 51, v * 9.3 + 23);
-  let interior = thicket * (0.5 + 0.5 * fine) * 0.5;
+  // Interior thicket cap raised relative to the boundary treeline (below):
+  // the boundary ring is a long unbroken strip, so even a lower per-cell
+  // density there out-clusters a patchy interior thicket by sheer contiguous
+  // length. An establishing shot auto-framed on "the densest cluster" was
+  // consistently locking onto the boundary ring, aiming half the frame past
+  // the sealed edge into open sky/fog instead of at the readable interior
+  // forest mass. Keeping the boundary present but sparser fixes what the
+  // auto-framer actually points at without touching the framer itself.
+  let interior = thicket * (0.5 + 0.5 * fine) * 0.62;
 
   interior *= smoothstep(pathDist, 6, 15);
   interior *= landmarkClearing(terrain, wx, wz);
 
-  const edgeDensity = edge * 0.46;
+  const edgeDensity = edge * 0.3;
   let d = Math.max(interior, edgeDensity);
   d *= 1 - THREE.MathUtils.clamp(slope * 1.6, 0, 0.6);
   return THREE.MathUtils.clamp(d, 0, 1);
@@ -173,7 +181,7 @@ export function buildForestFoliage({ rng, terrain }) {
   // single always-full-detail geometry rather than a cheap distance-LOD
   // variant -- every tree placed now has real branch/canopy structure, so
   // total tree count (not per-tree cost) is the budget lever.
-  const cellSize = 5.6;
+  const cellSize = 6.0;
   const cells = Math.round(worldSize / cellSize);
   const archXf = archetypes.map(() => []); // [{ m, hueT }]
   const litterXf = [];
@@ -221,7 +229,7 @@ export function buildForestFoliage({ rng, terrain }) {
       if (scale > 1.0) terrain.markSolidDisc(wx, wz, 0.32 * scale);
 
       // Leaf litter under canopy: only where there is a canopy to drop it.
-      if (arch.geo.canopy && rng.bool(0.7)) {
+      if (arch.geo.canopy && rng.bool(0.5)) {
         const litterScale = scale * arch.geo.height * 0.12;
         const litterM = new THREE.Matrix4().compose(
           new THREE.Vector3(wx, groundY + 0.01, wz),

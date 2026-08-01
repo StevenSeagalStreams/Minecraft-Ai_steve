@@ -181,16 +181,30 @@ function buildBranches(rng, parts, trunk, {
 }
 
 /**
- * Canopy: several overlapping noise-jittered ellipsoid masses anchored to
- * branch tips, asymmetrically offset so the cluster silhouette is broken
- * rather than a single blob. `defoliation` (0-1) is the fraction of tip
- * slots deliberately left bare -- this is what lets branch structure show
- * through a sparse crown instead of being fully hidden.
+ * Canopy: several overlapping noise-jittered ellipsoid masses that read as
+ * ONE lumpy crown, not scattered separate plates. The failure mode this
+ * guards against: branch tips fan out in random yaw directions around the
+ * whole trunk, so if a blob sits *exactly* at its tip with a radius smaller
+ * than the gap to its neighbours, each blob ends up floating alone near its
+ * own tip -- disconnected discs, not a canopy. Two things fix that: blobs
+ * are pulled substantially toward the crown centroid (so neighbours
+ * overlap into a cohesive asymmetric mass) and are sized to be a large
+ * fraction of the whole crown span rather than a small fraction of one
+ * branch's length. `defoliation` (0-1) is the fraction of slots deliberately
+ * left empty -- this is what lets branch structure show through a sparse
+ * crown instead of being fully hidden.
  */
 function buildCanopy(rng, branchRecords, { canopyScale, blobRange = [4, 9], defoliation = 0, droop = 0 }) {
   const anchors = [];
   for (const b of branchRecords) for (const p of b.branchTips) anchors.push(p);
   if (!anchors.length) return null;
+
+  // Crown centroid: blobs are pulled toward this point so the mass reads as
+  // one cohesive (if asymmetric) crown instead of separate plates hovering
+  // at each branch tip.
+  const centroid = new THREE.Vector3();
+  for (const p of anchors) centroid.add(p);
+  centroid.divideScalar(anchors.length);
 
   const targetCount = rng.int(blobRange[0], blobRange[1]);
   const parts = [];
@@ -200,24 +214,31 @@ function buildCanopy(rng, branchRecords, { canopyScale, blobRange = [4, 9], defo
   for (let i = 0; i < targetCount; i++) {
     const anchor = anchors[rng.int(0, anchors.length - 1)];
     if (bareUsed < maxBare && rng.next() < defoliation) { bareUsed++; continue; }
-    const rx = canopyScale * rng.range(0.5, 1.0);
-    const ry = canopyScale * rng.range(0.32, 0.62);
-    const rz = canopyScale * rng.range(0.5, 1.0);
-    const ox = rng.range(-0.32, 0.32) * canopyScale;
-    const oy = (rng.range(-0.12, 0.28) - droop) * canopyScale;
-    const oz = rng.range(-0.32, 0.32) * canopyScale;
+    // Pull the blob centre 35-65% of the way toward the crown centroid --
+    // enough that neighbouring blobs overlap generously, not so much that
+    // asymmetry (the point of using several offset blobs at all) is lost.
+    const pull = rng.range(0.35, 0.65);
+    const center = anchor.clone().lerp(centroid, pull);
+    const rx = canopyScale * rng.range(0.75, 1.3);
+    const ry = canopyScale * rng.range(0.6, 0.95);
+    const rz = canopyScale * rng.range(0.75, 1.3);
+    const ox = rng.range(-0.3, 0.3) * canopyScale;
+    const oy = (rng.range(-0.12, 0.3) - droop) * canopyScale;
+    const oz = rng.range(-0.3, 0.3) * canopyScale;
     parts.push(blob(rng, {
-      rx, ry, rz, wSeg: 6, hSeg: 5,
-      cx: anchor.x + ox, cy: anchor.y + oy, cz: anchor.z + oz,
-      jitter: 0.3,
+      rx, ry, rz, wSeg: 7, hSeg: 6,
+      cx: center.x + ox, cy: center.y + oy, cz: center.z + oz,
+      jitter: 0.26,
     }));
     placed++;
   }
   // Never fully bald when a canopy was actually requested -- guarantee one
-  // clump at the highest anchor so the tree doesn't silently become a snag.
+  // clump at the crown centroid so the tree doesn't silently become a snag.
   if (!placed) {
-    const top = anchors.reduce((a, b) => (b.y > a.y ? b : a), anchors[0]);
-    parts.push(blob(rng, { rx: canopyScale * 0.7, ry: canopyScale * 0.5, rz: canopyScale * 0.7, cx: top.x, cy: top.y, cz: top.z, jitter: 0.28 }));
+    parts.push(blob(rng, {
+      rx: canopyScale * 0.9, ry: canopyScale * 0.7, rz: canopyScale * 0.9,
+      cx: centroid.x, cy: centroid.y, cz: centroid.z, jitter: 0.24,
+    }));
   }
   return merge(parts);
 }
@@ -254,7 +275,7 @@ export function buildTallGaunt(rng) {
     lenFrac: 0.3, startFrac: 0.5, baseR, subChance: 0.5,
   });
   const canopy = buildCanopy(rng, branches, {
-    canopyScale: height * 0.15, blobRange: [4, 6], defoliation: rng.range(0.35, 0.55),
+    canopyScale: height * 0.17, blobRange: [4, 6], defoliation: rng.range(0.35, 0.55),
   });
   return { trunk: merge(parts), canopy, height, kind: 'tallGaunt' };
 }
@@ -305,7 +326,7 @@ export function buildSplitTrunk(rng) {
     branchRecords.push(...recs);
   }
   const canopy = buildCanopy(rng, branchRecords, {
-    canopyScale: height * 0.17, blobRange: [5, 8], defoliation: rng.range(0.3, 0.5),
+    canopyScale: height * 0.19, blobRange: [5, 8], defoliation: rng.range(0.3, 0.5),
   });
   return { trunk: merge(parts), canopy, height, kind: 'splitTrunk' };
 }
