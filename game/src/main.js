@@ -18,6 +18,8 @@ import { Monster } from './entities/Monster.js';
 import { resolveOverlaps } from './entities/Entity.js';
 
 import { HUD } from './ui/HUD.js';
+import { DebugConsole } from './core/Console.js';
+import { Telemetry } from './core/Telemetry.js';
 
 import { createFX } from './fx/index.js';
 import { createAudio } from './audio/index.js';
@@ -132,6 +134,11 @@ class Game {
 
     // Subsystems. Each owns a directory, is constructed once with the shared
     // context, and is ticked from exactly one phase of the loop below.
+    // Playtest instrumentation. Built before the subsystems so telemetry is
+    // subscribed to the bus in time to catch their first events.
+    this.telemetry = new Telemetry(this);
+    this.console = new DebugConsole(this);
+
     this.fx = createFX(this._ctx());
     this.audio = createAudio(this._ctx());
     this.items = createItems(this._ctx());
@@ -195,6 +202,12 @@ class Game {
     this.world.player = player;
     this.rig.snapTo(player.position);
 
+    // `god` is honoured here rather than inside Entity.damage, which belongs
+    // to the combat pillar. Wrapping the bound method keeps the cheat entirely
+    // inside the debug surface that owns it.
+    const baseDamage = player.damage.bind(player);
+    player.damage = (amount, source, opts) => (player.godMode ? 0 : baseDamage(amount, source, opts));
+
     // The zone decides where and what spawns; the loop only instantiates.
     for (const spawn of zone.spawns || []) {
       // Pass only what the zone legitimately knows. Every combat stat comes
@@ -214,6 +227,39 @@ class Game {
       this.entities.push(m);
       this.monsters.push(m);
     }
+  }
+
+  /**
+   * Spawn monsters in a ring around the player. Used by the debug console so a
+   * playtester can set up a specific fight in one command instead of hunting
+   * for one.
+   */
+  spawnMonsters(kind, count = 1) {
+    const rng = this.rng;
+    let spawned = 0;
+    for (let i = 0; i < count; i++) {
+      const a = (i / count) * Math.PI * 2 + rng.range(-0.2, 0.2);
+      const r = 4 + rng.range(0, 3);
+      const x = this.player.position.x + Math.sin(a) * r;
+      const z = this.player.position.z + Math.cos(a) * r;
+      if (this.world.colliders?.isBlocked(x, z, 0.6)) continue;
+      let m;
+      try {
+        m = new Monster({ kind, height: rng.range(1.6, 1.86) });
+      } catch (err) {
+        console.warn('spawnMonsters failed', err);
+        return spawned;
+      }
+      m.position.set(x, this.zone?.terrain?.heightAt?.(x, z) ?? 0, z);
+      m.spawnPoint.copy(m.position);
+      m.facing = m.targetFacing = rng.range(-Math.PI, Math.PI);
+      this.scene.add(m.object);
+      this.entities.push(m);
+      this.monsters.push(m);
+      this.bus.emit('entity:spawned', { entity: m });
+      spawned++;
+    }
+    return spawned;
   }
 
   // -------------------------------------------------------------- main loop
@@ -250,6 +296,7 @@ class Game {
     this.postfx.update(dt);
 
     this.hud.update(this.player);
+    this.telemetry.update(dt);
     this._updateDebug(dt);
 
     this.renderer.info.reset();

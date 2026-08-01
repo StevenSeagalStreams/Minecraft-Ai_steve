@@ -73,8 +73,13 @@ const LUMA_BANDS = {
  */
 const INTERIOR_ZONES = new Set(['catacombs']);
 function resolveShotType(declared, zone) {
-  if (INTERIOR_ZONES.has(zone) && declared !== 'interior') return 'interior';
-  return declared;
+  const zoneIsInterior = INTERIOR_ZONES.has(zone);
+  // Resolution is symmetric. A ground framing inside a dungeon is an interior
+  // shot -- and, just as importantly, the `corridor` scenario declares itself
+  // interior but degrades to an exterior framing in an outdoor zone, where
+  // grading it against the dungeon band reports a false TOO BRIGHT.
+  if (zoneIsInterior) return declared === 'vista' ? 'interior' : 'interior';
+  return declared === 'interior' ? 'ground' : declared;
 }
 
 function gradeLuma(shotType, meanLuma) {
