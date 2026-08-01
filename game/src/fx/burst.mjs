@@ -145,13 +145,25 @@ async function main() {
     await page.waitForFunction(() => window.__ready === true, { timeout: 120000 });
     await page.evaluate(() => document.getElementById('boot')?.remove());
     // Frame in close on the player, where the demo hook centres every effect.
-    await page.evaluate(() => {
+    // `--focus hitfx|beams|torch` recentres on the specific demo anchor
+    // instead of the player, since the default framing puts hit-fx and
+    // torches out of a 640x360 crop.
+    const FOCUS = args.focus ?? 'player';
+    await page.evaluate((focus) => {
       const g = window.__game;
-      g.rig.distance = 15;
-      g.rig.elevation = 0.4;
+      const p = g.player.position;
+      let target = p;
+      if (focus === 'hitfx') target = { x: p.x - 2.5, y: p.y + 0.9, z: p.z + 1.5 };
+      else if (focus === 'beams') target = { x: p.x + 5, y: p.y, z: p.z + 3 };
+      else if (focus === 'torch') {
+        const reqs = g.scene.userData.flameRequests;
+        target = reqs && reqs.length ? reqs[0].position : p;
+      }
+      g.rig.distance = focus === 'player' ? 15 : 7;
+      g.rig.elevation = 0.32;
       g.rig.updateOffset();
-      g.rig.snapTo(g.player.position);
-    });
+      g.rig.snapTo(target);
+    }, FOCUS);
     await page.waitForTimeout(2200); // let the demo hook fire its first rotation
 
     const report = await page.evaluate(() => {

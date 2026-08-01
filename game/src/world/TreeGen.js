@@ -134,33 +134,40 @@ function buildTrunk(rng, { height, baseR, segs = 3, bendAmt = 0.5, taperRatio = 
 
 /**
  * Primary branch hierarchy off a trunk (or trunk fork). Returns a list of
- * `{ origin, tip, branchTips }` records -- `branchTips` includes the primary
- * tip plus any secondary-stub tips -- for the canopy pass to anchor foliage
- * clumps to. `minAngleDeg`/`maxAngleDeg` bound the leave-angle off the trunk
- * (spec: 30-60 degrees).
+ * `{ origin, tip, branchTips, foliagePts }` records. `branchTips` is every
+ * tip (primary + secondary stubs), for silhouette/structure purposes;
+ * `foliagePts` is the subset the canopy pass is allowed to hang leaf mass
+ * from -- a deliberate ~25% of secondary stub tips are excluded so *some*
+ * bare twig always pokes past the leaf silhouette regardless of how the
+ * defoliation roll lands (spec: exposed branch tips on blighted trees).
+ * `minAngleDeg`/`maxAngleDeg` bound the leave-angle off the trunk (spec:
+ * 30-60 degrees). `startFrac` is deliberately low by default -- branches
+ * starting near mid-trunk are what create the "umbrella on a bare pole"
+ * silhouette; real crowns start filling in well below their own top.
  */
 function buildBranches(rng, parts, trunk, {
   count = 4, minAngleDeg = 30, maxAngleDeg = 60,
-  lenFrac = 0.34, startFrac = 0.42, baseR, subChance = 0.55,
+  lenFrac = 0.34, startFrac = 0.28, baseR, subChance = 0.55,
 }) {
   const records = [];
   for (let i = 0; i < count; i++) {
     const t = THREE.MathUtils.clamp(
-      THREE.MathUtils.lerp(startFrac, 0.97, count <= 1 ? 0.6 : i / (count - 1)) + rng.range(-0.05, 0.05),
+      THREE.MathUtils.lerp(startFrac, 0.95, count <= 1 ? 0.6 : i / (count - 1)) + rng.range(-0.05, 0.05),
       0.05, 0.99
     );
     const oy = trunk.topY * t;
     const origin = new THREE.Vector3(trunk.topPos.x * t, oy, trunk.topPos.z * t);
     const yaw = rng.range(0, Math.PI * 2);
     const rise = THREE.MathUtils.degToRad(rng.range(minAngleDeg, maxAngleDeg));
-    const len = trunk.height * lenFrac * rng.range(0.75, 1.3) * (1 - t * 0.25);
-    const r0 = baseR * rng.range(0.2, 0.32) * (1 - t * 0.3);
+    const len = trunk.height * lenFrac * rng.range(0.75, 1.3) * (1 - t * 0.2);
+    const r0 = baseR * rng.range(0.24, 0.36) * (1 - t * 0.3);
     const dir = sphericalDir(yaw, rise);
     const tip = origin.clone().addScaledVector(dir, len);
-    const s = segment(Math.max(0.015, r0 * 0.3), r0, origin, tip, 5, true);
+    const s = segment(Math.max(0.02, r0 * 0.3), r0, origin, tip, 5, true);
     if (s) parts.push(s);
 
     const branchTips = [tip];
+    const foliagePts = [tip];
     const subCount = rng.bool(subChance) ? 1 + rng.int(0, 1) : 0;
     for (let k = 0; k < subCount; k++) {
       const subT = rng.range(0.35, 0.8);
@@ -174,37 +181,49 @@ function buildBranches(rng, parts, trunk, {
       const subSeg = segment(Math.max(0.01, subR0 * 0.25), subR0, subOrigin, subTip, 4, true);
       if (subSeg) parts.push(subSeg);
       branchTips.push(subTip);
+      // ~25% of secondary stubs stay permanently bare -- guaranteed exposed
+      // structure, not left to the defoliation dice roll.
+      if (!rng.bool(0.25)) foliagePts.push(subTip);
     }
-    records.push({ origin, tip, branchTips, t });
+    records.push({ origin, tip, branchTips, foliagePts, t });
   }
   return records;
 }
 
 /**
  * Canopy: several overlapping noise-jittered ellipsoid masses that read as
- * ONE lumpy crown, not scattered separate plates. The failure mode this
- * guards against: branch tips fan out in random yaw directions around the
- * whole trunk, so if a blob sits *exactly* at its tip with a radius smaller
- * than the gap to its neighbours, each blob ends up floating alone near its
- * own tip -- disconnected discs, not a canopy. Two things fix that: blobs
- * are pulled substantially toward the crown centroid (so neighbours
- * overlap into a cohesive asymmetric mass) and are sized to be a large
- * fraction of the whole crown span rather than a small fraction of one
- * branch's length. `defoliation` (0-1) is the fraction of slots deliberately
- * left empty -- this is what lets branch structure show through a sparse
- * crown instead of being fully hidden.
+ * ONE lumpy, vertically-distributed crown -- not a single high cap floating
+ * over a bare pole (the "mushroom/umbrella" failure) and not scattered
+ * separate plates.
+ *
+ * Two distinct failure modes, two distinct fixes:
+ *   - Tips fan out in random yaw around the whole trunk, so a blob sized to
+ *     its own tip with nothing pulling it toward its neighbours floats alone
+ *     -- fixed by pulling each blob HORIZONTALLY toward the trunk axis
+ *     (not toward a single 3D centroid). Pulling horizontally only, at each
+ *     anchor's own height, makes neighbours at similar heights overlap into
+ *     one mass while *preserving* the natural height spread between low
+ *     branch origins and high branch tips.
+ *   - Anchoring blobs only at branch *tips* leaves the whole lower half of
+ *     the branch structure -- and the gap between trunk-top and canopy-
+ *     bottom -- bare, which is exactly the mushroom read. Fixed by anchoring
+ *     roughly half the blobs at branch *origins* (where limbs leave the
+ *     trunk) instead of tips, so leaf mass hangs down into the branch
+ *     structure and interpenetrates the upper trunk rather than capping it.
+ *
+ * `defoliation` (0-1) is the fraction of slots deliberately left empty, and
+ * `foliagePts` (passed in per branch record) already permanently excludes
+ * some secondary-stub tips -- between the two, bare structure is guaranteed
+ * to show, not left to chance.
  */
 function buildCanopy(rng, branchRecords, { canopyScale, blobRange = [4, 9], defoliation = 0, droop = 0 }) {
-  const anchors = [];
-  for (const b of branchRecords) for (const p of b.branchTips) anchors.push(p);
-  if (!anchors.length) return null;
-
-  // Crown centroid: blobs are pulled toward this point so the mass reads as
-  // one cohesive (if asymmetric) crown instead of separate plates hovering
-  // at each branch tip.
-  const centroid = new THREE.Vector3();
-  for (const p of anchors) centroid.add(p);
-  centroid.divideScalar(anchors.length);
+  const tipAnchors = [];
+  const originAnchors = [];
+  for (const b of branchRecords) {
+    for (const p of b.foliagePts) tipAnchors.push(p);
+    originAnchors.push(b.origin);
+  }
+  if (!tipAnchors.length) return null;
 
   const targetCount = rng.int(blobRange[0], blobRange[1]);
   const parts = [];
@@ -212,18 +231,24 @@ function buildCanopy(rng, branchRecords, { canopyScale, blobRange = [4, 9], defo
   const maxBare = Math.max(0, Math.floor(targetCount * defoliation));
   let bareUsed = 0;
   for (let i = 0; i < targetCount; i++) {
-    const anchor = anchors[rng.int(0, anchors.length - 1)];
+    // Roughly half the blobs hang from branch origins (low, against the
+    // trunk) and half from tips (high, at the crown edge) -- mass spans the
+    // whole branch structure instead of capping it.
+    const fromOrigin = originAnchors.length > 0 && rng.bool(0.45);
+    const pool = fromOrigin ? originAnchors : tipAnchors;
+    const anchor = pool[rng.int(0, pool.length - 1)];
     if (bareUsed < maxBare && rng.next() < defoliation) { bareUsed++; continue; }
-    // Pull the blob centre 35-65% of the way toward the crown centroid --
-    // enough that neighbouring blobs overlap generously, not so much that
-    // asymmetry (the point of using several offset blobs at all) is lost.
-    const pull = rng.range(0.35, 0.65);
-    const center = anchor.clone().lerp(centroid, pull);
-    const rx = canopyScale * rng.range(0.75, 1.3);
-    const ry = canopyScale * rng.range(0.6, 0.95);
-    const rz = canopyScale * rng.range(0.75, 1.3);
+    // Pull 20-45% of the way toward the trunk axis at this anchor's OWN
+    // height (not toward a shared centroid) -- neighbours at similar
+    // heights overlap without collapsing the whole crown to one Y level.
+    const pull = rng.range(0.2, 0.45);
+    const axisTarget = new THREE.Vector3(0, anchor.y, 0);
+    const center = anchor.clone().lerp(axisTarget, pull);
+    const rx = canopyScale * rng.range(0.7, 1.2);
+    const ry = canopyScale * rng.range(0.55, 0.9);
+    const rz = canopyScale * rng.range(0.7, 1.2);
     const ox = rng.range(-0.3, 0.3) * canopyScale;
-    const oy = (rng.range(-0.12, 0.3) - droop) * canopyScale;
+    const oy = (rng.range(-0.3, 0.35) - droop) * canopyScale;
     const oz = rng.range(-0.3, 0.3) * canopyScale;
     parts.push(blob(rng, {
       rx, ry, rz, wSeg: 7, hSeg: 6,
@@ -233,11 +258,12 @@ function buildCanopy(rng, branchRecords, { canopyScale, blobRange = [4, 9], defo
     placed++;
   }
   // Never fully bald when a canopy was actually requested -- guarantee one
-  // clump at the crown centroid so the tree doesn't silently become a snag.
+  // clump at the highest tip so the tree doesn't silently become a snag.
   if (!placed) {
+    const top = tipAnchors.reduce((a, b) => (b.y > a.y ? b : a), tipAnchors[0]);
     parts.push(blob(rng, {
       rx: canopyScale * 0.9, ry: canopyScale * 0.7, rz: canopyScale * 0.9,
-      cx: centroid.x, cy: centroid.y, cz: centroid.z, jitter: 0.24,
+      cx: top.x, cy: top.y, cz: top.z, jitter: 0.24,
     }));
   }
   return merge(parts);
@@ -267,12 +293,12 @@ function buildFracture(rng, parts, topPos, topR, topY, height) {
  * crown, exposed upper branch tips. */
 export function buildTallGaunt(rng) {
   const height = rng.range(9.5, 14.5);
-  const baseR = rng.range(0.26, 0.38);
-  const trunk = buildTrunk(rng, { height, baseR, segs: 3, bendAmt: 0.4, taperRatio: 0.33, radial: 7 });
+  const baseR = rng.range(0.34, 0.48);
+  const trunk = buildTrunk(rng, { height, baseR, segs: 3, bendAmt: 0.4, taperRatio: 0.35, radial: 7 });
   const parts = [...trunk.parts];
   const branches = buildBranches(rng, parts, trunk, {
-    count: 3 + rng.int(0, 1), minAngleDeg: 32, maxAngleDeg: 58,
-    lenFrac: 0.3, startFrac: 0.5, baseR, subChance: 0.5,
+    count: 4 + rng.int(0, 2), minAngleDeg: 32, maxAngleDeg: 58,
+    lenFrac: 0.32, startFrac: 0.26, baseR, subChance: 0.55,
   });
   const canopy = buildCanopy(rng, branches, {
     canopyScale: height * 0.17, blobRange: [4, 6], defoliation: rng.range(0.35, 0.55),
@@ -284,7 +310,7 @@ export function buildTallGaunt(rng) {
  * silhouette but sick: heavy horizontal limbs and a drooping, holed canopy. */
 export function buildBroadDying(rng) {
   const height = rng.range(6.5, 9.5);
-  const baseR = rng.range(0.4, 0.58);
+  const baseR = rng.range(0.5, 0.7);
   const trunk = buildTrunk(rng, { height, baseR, segs: 2, bendAmt: 0.3, taperRatio: 0.4, radial: 7 });
   const parts = [...trunk.parts];
   const branches = buildBranches(rng, parts, trunk, {
@@ -301,7 +327,7 @@ export function buildBroadDying(rng) {
  * own smaller branch set and canopy. */
 export function buildSplitTrunk(rng) {
   const height = rng.range(8.5, 12.5);
-  const baseR = rng.range(0.36, 0.5);
+  const baseR = rng.range(0.46, 0.62);
   const forkT = rng.range(0.42, 0.58);
   const lowerHeight = height * forkT;
   const lower = buildTrunk(rng, { height: lowerHeight, baseR, segs: 2, bendAmt: 0.35, taperRatio: 0.8, radial: 7 });
@@ -321,7 +347,7 @@ export function buildSplitTrunk(rng) {
     const leaderTrunk = { topY: tip.y, topPos: tip, topR: leaderR * 0.3, height: leaderLen };
     const recs = buildBranches(rng, parts, leaderTrunk, {
       count: 2 + rng.int(0, 1), minAngleDeg: 30, maxAngleDeg: 55,
-      lenFrac: 0.5, startFrac: 0.5, baseR: leaderR, subChance: 0.4,
+      lenFrac: 0.5, startFrac: 0.28, baseR: leaderR, subChance: 0.45,
     });
     branchRecords.push(...recs);
   }
@@ -335,7 +361,7 @@ export function buildSplitTrunk(rng) {
  * hierarchy of bare stubs plus a fractured top. Pure silhouette structure. */
 export function buildBareSnag(rng) {
   const height = rng.range(3.4, 6.6);
-  const baseR = rng.range(0.3, 0.48);
+  const baseR = rng.range(0.38, 0.58);
   const trunk = buildTrunk(rng, { height, baseR, segs: 2, bendAmt: 0.32, taperRatio: 0.45, radial: 6 });
   const parts = [...trunk.parts];
   buildFracture(rng, parts, trunk.topPos, trunk.topR, trunk.topY, height);
@@ -352,12 +378,12 @@ export function buildBareSnag(rng) {
  * new growth is trying (and mostly failing) against the blight. */
 export function buildSapling(rng) {
   const height = rng.range(2.0, 3.6);
-  const baseR = rng.range(0.06, 0.11);
+  const baseR = rng.range(0.09, 0.15);
   const trunk = buildTrunk(rng, { height, baseR, segs: 2, bendAmt: 0.5, taperRatio: 0.4, radial: 6 });
   const parts = [...trunk.parts];
   const branches = buildBranches(rng, parts, trunk, {
-    count: 2 + rng.int(0, 1), minAngleDeg: 38, maxAngleDeg: 62,
-    lenFrac: 0.4, startFrac: 0.45, baseR, subChance: 0.3,
+    count: 3 + rng.int(0, 1), minAngleDeg: 38, maxAngleDeg: 62,
+    lenFrac: 0.42, startFrac: 0.3, baseR, subChance: 0.35,
   });
   const canopy = buildCanopy(rng, branches, {
     canopyScale: height * 0.3, blobRange: [3, 5], defoliation: rng.range(0.1, 0.25),

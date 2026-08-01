@@ -3,3 +3,7 @@ game/node_modules/
 game/dist/
 game/shots/
 *.log
+# Agent scratch scripts — these get created in the game root during
+# iteration and were being swept in by blanket `git add -A`.
+game/*_tmp.mjs
+game/check_*.mjs

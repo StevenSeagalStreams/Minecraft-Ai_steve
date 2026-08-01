@@ -214,7 +214,12 @@ export class Terrain {
       const ny = THREE.MathUtils.clamp(normalAttr.getY(k), 0, 1);
       const s = 1 - ny;
       slope[k] = s;
-      const rw = smoothstep(s, 0.11, 0.30);
+      // Loosened from (0.11, 0.30): that let bare rock take over any
+      // moderately sloped ground, which is most of a heightmapped forest --
+      // exactly the "cracked desert hardpan" read the critic called out.
+      // Real forest floor stays grass/dirt-covered until a slope is
+      // genuinely steep; only that should go bare.
+      const rw = smoothstep(s, 0.26, 0.52);
       rockW[k] = rw;
       const lowness = smoothstep(height[k], 2.2, -1.4);
       let mw = Math.min(1, this.fields.hollow[k] * 1.3) * lowness * (1 - rw * 0.7);
@@ -368,12 +373,15 @@ export class Terrain {
 function buildDeadGrassMaterial(seed, size = 256) {
   const noiseA = makeValueNoise(seed >>> 0);
   const noiseB = makeValueNoise((seed ^ 0x2545f491) >>> 0);
+  // No worley here at all -- any cell-noise component, however low the
+  // weight, tiles as a visible hex/crack grid once world-space UVs repeat
+  // it across a large ground plane (exactly the "cracked hardpan" read).
+  // Grass/dirt relief comes from two octaves of plain fbm at different
+  // scales instead: organic, non-cellular, no repeating network structure.
   const height = generateHeight(size, (u, v) => {
     const clump = fbm(noiseA, u * 5 + 2, v * 5 + 7, { octaves: 4, basePeriod: 5 });
-    const { f1 } = worley(u * 9 + 3, v * 9 + 11, 7, 4021);
-    const tuft = 1 - Math.min(1, f1 * 1.7);
-    const fine = fbm(noiseB, u * 24 + 9, v * 24 + 2, { octaves: 3, basePeriod: 20 }) - 0.5;
-    return clump * 0.55 + tuft * 0.32 + fine * 0.13;
+    const fine = fbm(noiseB, u * 13 + 9, v * 13 + 2, { octaves: 3, basePeriod: 13 }) - 0.5;
+    return clump * 0.8 + fine * 0.2;
   });
   const albedo = generateImage(size, (u, v, x, y) => {
     const h = height[y * size + x];
@@ -384,7 +392,7 @@ function buildDeadGrassMaterial(seed, size = 256) {
     let r = THREE.MathUtils.lerp(0.20, 0.42, t);
     let g = THREE.MathUtils.lerp(0.18, 0.38, t);
     let b = THREE.MathUtils.lerp(0.13, 0.24, t);
-    const greenAmt = smoothstep(patchy, 0.6, 0.82) * 0.55;
+    const greenAmt = smoothstep(patchy, 0.5, 0.78) * 0.68;
     r = THREE.MathUtils.lerp(r, 0.27, greenAmt);
     g = THREE.MathUtils.lerp(g, 0.32, greenAmt);
     b = THREE.MathUtils.lerp(b, 0.18, greenAmt);
@@ -393,7 +401,10 @@ function buildDeadGrassMaterial(seed, size = 256) {
     const shade = (0.82 + h * 0.32) * (1 - litter);
     return [r * shade, g * shade, b * shade, 1];
   });
-  const normalCanvas = heightToNormal(height, size, 1.3);
+  // Softer relief than the rock layers (0.85 vs ~2+): grass/dirt has low
+  // bump, not carved cavities -- another lever that was making this layer
+  // read as stone regardless of color.
+  const normalCanvas = heightToNormal(height, size, 0.85);
   return new THREE.MeshStandardMaterial({
     map: toTexture(albedo, { srgb: true, repeat: 1 }),
     normalMap: toTexture(normalCanvas, { srgb: false, repeat: 1 }),
