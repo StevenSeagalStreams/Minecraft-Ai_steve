@@ -70,7 +70,13 @@ try {
 
   await page.goto(`http://127.0.0.1:${PORT}/?seed=${SEED}&zone=${ZONE}&quality=medium`,
     { waitUntil: 'domcontentloaded', timeout: 180000 });
-  await page.waitForFunction(() => window.__ready === true, { timeout: 240000 });
+  try {
+    await page.waitForFunction(() => window.__ready === true, { timeout: 240000 });
+  } catch (e) {
+    const boot = await page.evaluate(() => window.__bootError || null);
+    console.log('GAME NEVER BECAME READY.\nbootError: ' + boot + '\nconsole:\n' + errs.slice(0, 12).join('\n'));
+    throw e;
+  }
   await page.waitForTimeout(2500);
 
   /**

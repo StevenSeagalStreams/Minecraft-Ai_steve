@@ -1,225 +1,65 @@
 import * as THREE from 'three';
-import { box, cylinder, sphere, merge } from './GeoKit.js';
+import { box, merge } from './GeoKit.js';
 import { smoothstep } from '../render/TextureGen.js';
+import { segment } from './GeoKit.js';
+import { ARCHETYPES, pickArchetype, getBarkNormalMap } from './TreeGen.js';
 
 /**
- * Blighted-forest foliage: parametric trees (silhouette-mass first,
- * individual tree second -- the WoW pillar) plus the undergrowth that keeps
- * the ground from reading as empty between them. Everything here ends up as
- * a small, fixed number of InstancedMesh draw calls no matter how many
- * thousand instances are scattered.
+ * Blighted-forest foliage: five tree archetypes built once in TreeGen.js
+ * (trunk+branch hierarchy merged into one geometry, canopy -- where the
+ * archetype has one -- merged into a second), each instanced through exactly
+ * one (or two) `InstancedMesh` draw calls no matter how many thousand
+ * instances are scattered. Everything else here is placement: where trees
+ * go, which archetype, what per-instance scale/lean/hue variance, plus the
+ * undergrowth and leaf-litter scatter that keeps the ground from reading as
+ * empty (or as bare rock) between them.
  *
- * Perf discipline (M1 fix pass): a tree is cheap on purpose. Trunk/branch
- * segments are open-ended cylinders (the joints are all hidden inside the
- * next segment or a canopy clump, so the end caps are wasted triangles) and
- * canopies are a few large low-poly blobs rather than many small ones. A
- * second, drastically cheaper "mass" tree variant is used for the sealed
- * boundary treeline and anything far from the authored trail -- a crude
- * static LOD keyed on proximity-to-route rather than camera distance, since
- * the zone's update(dt) signature has no camera to measure against (see the
- * note at the bottom of this file).
+ * M2 rebuild: the M1 trees were flat hexagonal-slab canopies on bare poles
+ * (gate-2 critic: "a canyon, a dry wash, or a cave interior"). This pass
+ * replaces that geometry wholesale -- see TreeGen.js for the archetype
+ * builders -- and keeps the same InstancedMesh-per-archetype discipline so
+ * total draw calls for the whole forest stay in the single digits.
  */
 
 // ---------------------------------------------------------------------------
-// tree geometry
+// silhouette diagnostic
 // ---------------------------------------------------------------------------
+
+/**
+ * `?silhouette=1` forces every tree material to pure black unlit. This is
+ * the actual pass/fail test for tree geometry: render flat black against the
+ * sky and ask whether the shapes read as trees with zero material/lighting
+ * information to lean on. Left in permanently as a diagnostic, not a one-off
+ * hack -- silhouette readability regresses silently otherwise.
+ */
+const SILHOUETTE_MODE = (() => {
+  try {
+    return typeof location !== 'undefined'
+      && new URLSearchParams(location.search).get('silhouette') === '1';
+  } catch {
+    return false;
+  }
+})();
 
 const _up = new THREE.Vector3(0, 1, 0);
-const _one = new THREE.Vector3(1, 1, 1);
 
-/**
- * A tapered cylinder spanning two explicit points, built by aligning a
- * default Y-axis CylinderGeometry with a quaternion rather than composing
- * Euler rotY/rotZ guesses -- exact for an arbitrary direction, and it means
- * the "tip" used to chain sub-branches/canopy is the same point the mesh
- * actually ends at.
- */
-function orientedSegment(rt, rb, from, to, radial = 6, openEnded = true) {
-  const dir = new THREE.Vector3().subVectors(to, from);
-  const len = dir.length();
-  if (len < 1e-5) return null;
-  // Interior joints and branch tips are never seen end-on at this camera
-  // angle -- open-ended saves 2*radial triangles per segment for free.
-  const g = new THREE.CylinderGeometry(rt, rb, len, radial, 1, openEnded);
-  g.translate(0, len / 2, 0);
-  const q = new THREE.Quaternion().setFromUnitVectors(_up, dir.multiplyScalar(1 / len));
-  g.applyMatrix4(new THREE.Matrix4().compose(from, q, _one));
-  return g;
-}
+// ---------------------------------------------------------------------------
+// per-instance color: hue jitter (+/-5%) driven by one shared random value
+// per tree so bark and canopy shift together (a given tree reads as
+// consistently warmer/cooler, not bark and leaves jittered independently).
+// ---------------------------------------------------------------------------
 
-function sphericalDir(yaw, rise) {
-  return new THREE.Vector3(Math.sin(yaw) * Math.cos(rise), Math.sin(rise), Math.cos(yaw) * Math.cos(rise));
-}
-
-/** Root flare + tapered multi-segment trunk, shared by every tree variant.
- * Two segments (was three) plus a flare -- at instance scale the third
- * segment's extra bend read as noise, not shape. Every joint is open-ended
- * except the final one (which the canopy/branches don't always fully cover
- * from above, so it keeps a real cap). */
-function buildTrunkCore(rng, { height, baseR, segs = 2, bend = 0.35 }) {
-  const parts = [];
-  const flareH = height * 0.10;
-  parts.push(cylinder(baseR * 1.05, baseR * 2.15, flareH, 6, 0, flareH / 2, 0, 0, true));
-
-  let cur = new THREE.Vector3(0, flareH, 0);
-  let r = baseR * 1.05;
-  const segH = (height - flareH) / segs;
-  for (let i = 0; i < segs; i++) {
-    const rNext = baseR * (1 - (i + 1) / (segs + 0.4)) * 0.95 + baseR * 0.12;
-    const next = new THREE.Vector3(
-      cur.x + rng.range(-1, 1) * bend * segH * 0.6,
-      cur.y + segH,
-      cur.z + rng.range(-1, 1) * bend * segH * 0.6
-    );
-    const isTop = i === segs - 1;
-    const seg = orientedSegment(rNext, r, cur, next, 5, !isTop);
-    if (seg) parts.push(seg);
-    cur = next;
-    r = rNext;
-  }
-  return { parts, topY: cur.y, topR: r, topPos: cur };
-}
-
-/** A single tapered branch with an occasional sub-branch, returns tip
- * positions for canopy attachment. Thinner radial counts and a lower
- * sub-branch rate than the original -- branches are silhouette mass, not
- * close-inspection detail. */
-function buildBranch(rng, parts, origin, dirAngleY, riseAngle, len, r0) {
-  const dir = sphericalDir(dirAngleY, riseAngle);
-  const tip = origin.clone().addScaledVector(dir, len);
-  const seg = orientedSegment(r0 * 0.32, r0, origin, tip, 4);
-  if (seg) parts.push(seg);
-
-  if (rng.bool(0.3)) {
-    const subLen = len * rng.range(0.4, 0.6);
-    const subYaw = dirAngleY + rng.range(-0.9, 0.9);
-    const subRise = riseAngle + rng.range(0.1, 0.5);
-    const subDir = sphericalDir(subYaw, subRise);
-    const subTip = tip.clone().addScaledVector(subDir, subLen);
-    const sub = orientedSegment(r0 * 0.12, r0 * 0.38, tip, subTip, 3);
-    if (sub) parts.push(sub);
-    return [tip, subTip];
-  }
-  return [tip];
-}
-
-/** A low-poly, chunky "clump" of dead/curled foliage -- faceted, not smooth,
- * so it reads as a silhouette mass rather than noisy detail. Fewer, larger
- * blobs than the original cost about a third as much for the same visual
- * bulk (radius bumped up to compensate for the lower count). */
-function buildCanopyClump(rng, cx, cy, cz, scale) {
-  const parts = [];
-  const n = 1 + rng.int(0, 1);
-  for (let i = 0; i < n; i++) {
-    const ox = rng.range(-0.3, 0.3) * scale;
-    const oy = rng.range(-0.15, 0.2) * scale;
-    const oz = rng.range(-0.3, 0.3) * scale;
-    const r = scale * rng.range(0.6, 0.95);
-    parts.push(sphere(r, 5, 3, cx + ox, cy + oy, cz + oz, 0.72));
-  }
-  return parts;
-}
-
-/** Full blighted tree: root flare, bent trunk, sparse branch hierarchy, a few
- * curled canopy clumps at some (not all) branch tips -- diseased sparseness
- * over a healthy full crown. Used only for placements near the authored
- * route (see the LOD note below); this is the "near tier" tree. */
-export function buildFullTreeGeometry(rng) {
-  const height = rng.range(6.5, 10.5);
-  const baseR = rng.range(0.26, 0.4);
-  const core = buildTrunkCore(rng, { height: height * 0.62, baseR, segs: 2, bend: 0.5 });
-  const parts = [...core.parts];
-
-  const branchCount = 3 + rng.int(0, 2);
-  const canopyParts = [];
-  let originY = core.topY * 0.55;
-  for (let i = 0; i < branchCount; i++) {
-    const t = i / (branchCount - 1 + 0.001);
-    const oy = THREE.MathUtils.lerp(originY, core.topY * 0.98, t);
-    const origin = new THREE.Vector3(core.topPos.x * (oy / core.topY), oy, core.topPos.z * (oy / core.topY));
-    const dirAngleY = rng.range(0, Math.PI * 2);
-    const riseAngle = rng.range(0.12, 0.55);
-    const len = height * rng.range(0.22, 0.36) * (1 - t * 0.3);
-    const r0 = baseR * rng.range(0.22, 0.34);
-    const tips = buildBranch(rng, parts, origin, dirAngleY, riseAngle, len, r0);
-    if (rng.bool(0.6)) {
-      for (const tip of tips) {
-        canopyParts.push(...buildCanopyClump(rng, tip.x, tip.y, tip.z, height * 0.16));
-      }
-    }
-  }
-  // A jagged broken-off stub near the top sells "blighted" even on the
-  // otherwise-fullest variant.
-  if (rng.bool(0.4)) {
-    const stubY = core.topY * rng.range(0.7, 0.92);
-    parts.push(cylinder(baseR * 0.05, baseR * 0.22, height * 0.1, 4, core.topPos.x * 0.4, stubY, core.topPos.z * 0.4, 0, rng.range(-0.3, 0.3), true));
-  }
-
-  return {
-    trunk: merge(parts),
-    canopy: canopyParts.length ? merge(canopyParts) : null,
-    height,
-  };
-}
-
-/** A snapped, dead trunk -- no canopy, jagged fracture at the break. Also a
- * "near tier" variant (it's the cheaper of the two originally, but it still
- * only spawns close to the route -- see the LOD note below). */
-export function buildSnappedTreeGeometry(rng) {
-  const height = rng.range(3.0, 5.6);
-  const baseR = rng.range(0.28, 0.44);
-  const core = buildTrunkCore(rng, { height, baseR, segs: 2, bend: 0.35 });
-  const parts = [...core.parts];
-
-  // Fractured top cap: a cluster of small shards angled outward from the
-  // break point instead of a clean cylinder cap.
-  const shardN = 3 + rng.int(0, 2);
-  for (let i = 0; i < shardN; i++) {
-    const a = (i / shardN) * Math.PI * 2 + rng.range(-0.3, 0.3);
-    const r = core.topR * rng.range(0.5, 0.95);
-    const shardH = height * rng.range(0.06, 0.14);
-    parts.push(box(
-      core.topR * 0.5, shardH, core.topR * 0.5,
-      core.topPos.x + Math.cos(a) * r * 0.5, core.topY + shardH * 0.4, core.topPos.z + Math.sin(a) * r * 0.5,
-      a
-    ));
-  }
-  // One long bare lateral branch remnant, low on the trunk.
-  if (rng.bool(0.7)) {
-    const origin = new THREE.Vector3(0, height * rng.range(0.3, 0.55), 0);
-    buildBranch(rng, parts, origin, rng.range(0, Math.PI * 2), rng.range(-0.1, 0.2), height * rng.range(0.35, 0.55), baseR * 0.3);
-  }
-
-  return { trunk: merge(parts), canopy: null, height };
-}
-
-/**
- * "Mass tier" tree: a single tapered trunk cylinder plus one or two big
- * canopy blobs -- no branch hierarchy at all. This is the LOD variant, used
- * for the sealed boundary treeline and everything far from the authored
- * route (see the note below `buildForestFoliage`). It costs roughly a tenth
- * of a near-tier full tree but reads identically as silhouette mass at the
- * range it is actually seen from.
- */
-export function buildMassTreeGeometry(rng) {
-  const height = rng.range(6.0, 10.0);
-  const baseR = rng.range(0.24, 0.38);
-  const lean = rng.range(-0.6, 0.6) * height * 0.08;
-  const trunk = orientedSegment(
-    baseR * 0.18, baseR * 1.15,
-    new THREE.Vector3(0, 0, 0), new THREE.Vector3(lean, height * 0.6, lean * 0.6),
-    5, false
-  );
-  const canopyParts = buildCanopyClump(rng, lean * 1.3, height * 0.66, lean * 0.8, height * 0.24);
-  return {
-    trunk: merge([trunk]),
-    canopy: merge(canopyParts),
-    height,
-  };
+function jitterFromBase(baseColor, t, { hue = 0.05, sat = 0.12, light = 0.15 } = {}) {
+  const hsl = { h: 0, s: 0, l: 0 };
+  baseColor.getHSL(hsl);
+  const h = (hsl.h + t * hue + 1) % 1;
+  const s = THREE.MathUtils.clamp(hsl.s * (1 + t * sat), 0, 1);
+  const l = THREE.MathUtils.clamp(hsl.l * (1 + t * light), 0, 1);
+  return new THREE.Color().setHSL(h, s, l);
 }
 
 // ---------------------------------------------------------------------------
-// placement
+// placement helpers
 // ---------------------------------------------------------------------------
 
 /** Cheap deterministic 2D hash-noise (no tiling requirement here). */
@@ -256,8 +96,7 @@ function landmarkClearing(terrain, wx, wz) {
 /**
  * Density is deliberately low and deliberately contrasty: thicket, clearing,
  * thicket, never a uniform lawn. `pathDist` is threaded in from the caller
- * (it is also used there to pick the LOD tier) so it is only computed once
- * per candidate cell.
+ * so it is only computed once per candidate cell.
  */
 function treeDensityAt(terrain, wx, wz, pathDist) {
   const slope = terrain.slopeAt(wx, wz);
@@ -266,200 +105,204 @@ function treeDensityAt(terrain, wx, wz, pathDist) {
   if (water > 0.3) return 0;
   if (slope > 0.34) return 0.02;
 
-  // Low-frequency mask carves distinct thickets and clearings out of the
-  // interior -- sharp contrast (smoothstep, not a smooth gradient) so most
-  // cells sit near zero and only clustered patches rise toward the cap.
   const u = wx / terrain.worldSize, v = wz / terrain.worldSize;
   const clump = hashNoise(u * 3.0 + 11, v * 3.0 + 4);
   const thicket = smoothstep(clump, 0.5, 0.7);
   const fine = hashNoise(u * 9.3 + 51, v * 9.3 + 23);
-  let interior = thicket * (0.5 + 0.5 * fine) * 0.48; // cap: real clearings, not a closed canopy
+  let interior = thicket * (0.5 + 0.5 * fine) * 0.5;
 
-  // A real clearing corridor along the trail (wider than the literal path
-  // texture strip) and around the two landmarks -- this is what lets the low
-  // sun actually strike the ground the player walks on.
   interior *= smoothstep(pathDist, 6, 15);
   interior *= landmarkClearing(terrain, wx, wz);
 
-  const edgeDensity = edge * 0.44; // dense-*reading* sealed treeline at the boundary,
-  let d = Math.max(interior, edgeDensity);              // regardless of clearings
+  const edgeDensity = edge * 0.46;
+  let d = Math.max(interior, edgeDensity);
   d *= 1 - THREE.MathUtils.clamp(slope * 1.6, 0, 0.6);
   return THREE.MathUtils.clamp(d, 0, 1);
 }
+
+// ---------------------------------------------------------------------------
+// forest build: five archetypes, each one (trunk InstancedMesh) + optional
+// (canopy InstancedMesh) -- <= 10 draw calls total regardless of instance
+// count, per the M2 budget.
+// ---------------------------------------------------------------------------
 
 export function buildForestFoliage({ rng, terrain }) {
   const group = new THREE.Group();
   group.name = 'Foliage';
   const worldSize = terrain.worldSize;
 
-  // A handful of *distinct* authored variants, each its own InstancedMesh --
-  // merging different trees' geometry into one buffer would stack every
-  // variant on top of every instance, so variety has to live in the count of
-  // draw calls (still tiny) rather than in a single shared buffer.
-  //
-  // Two LOD tiers: "near" (full branch hierarchy) for placements close to
-  // the authored route, where the player actually walks past them, and
-  // "mass" (trunk + one or two canopy blobs, ~a tenth of the cost) for the
-  // sealed boundary treeline and everything far from the route -- exactly
-  // the trees that only ever read as a distant silhouette. See the note at
-  // the end of this function for why this is proximity-keyed rather than
-  // true camera-distance LOD.
-  const fullVariants = [buildFullTreeGeometry(rng), buildFullTreeGeometry(rng)];
-  const snappedVariants = [buildSnappedTreeGeometry(rng)];
-  const massVariants = [buildMassTreeGeometry(rng), buildMassTreeGeometry(rng)];
+  // Build each archetype's geometry exactly once. A dedicated rng fork keeps
+  // "which tree shapes exist" independent of "where they get placed".
+  const archRng = rng.fork ? rng.fork('archetypes') : rng;
+  const archetypes = ARCHETYPES.map((a) => ({ name: a.name, weight: a.weight, geo: a.build(archRng) }));
 
-  const barkMat = (terrain.materials?.bark || terrain.materials?.woodBeams || terrain.materials?.floor).clone();
-  barkMat.color = new THREE.Color(0x38342a);
-  barkMat.roughness = Math.min(1, (barkMat.roughness ?? 0.8) + 0.05);
+  const silhouetteMat = SILHOUETTE_MODE ? new THREE.MeshBasicMaterial({ color: 0x000000, fog: false }) : null;
 
-  const leafMat = (terrain.materials?.deadLeaves || terrain.materials?.roughRock || terrain.materials?.floor).clone();
-  leafMat.color = new THREE.Color(0x565f3e);
-  leafMat.roughness = Math.min(1, (leafMat.roughness ?? 0.8));
+  const barkBase = new THREE.Color(0x3a3226);
+  const leafBase = new THREE.Color(0x545c3c);
+  const litterBase = new THREE.Color(0x4a3722);
 
-  const massBarkMat = barkMat.clone();
-  massBarkMat.color = new THREE.Color(0x322e25);
-  const massLeafMat = leafMat.clone();
-  massLeafMat.color = new THREE.Color(0x505936);
+  const barkMat = silhouetteMat || (() => {
+    const m = (terrain.materials?.bark || terrain.materials?.woodBeams || terrain.materials?.floor).clone();
+    m.color = new THREE.Color(0xffffff); // per-instance color carries the actual hue -- see jitterFromBase
+    m.roughness = 0.9;
+    const normal = getBarkNormalMap();
+    if (normal) {
+      m.normalMap = normal;
+      m.normalScale = new THREE.Vector2(1.1, 1.1);
+    }
+    return m;
+  })();
 
-  // --- placement pass: jittered grid, density-gated, hard-filtered by nav --
-  // Coarser than the original (2.6m -> 4.4m): fewer candidate cells is most
-  // of how total tree count drops from ~3000+ to the 250-400 target: a
-  // closed canopy at 43 sqm/tree cannot pass any light, however cheap each
-  // individual tree is.
-  const cellSize = 4.4;
+  const leafMat = silhouetteMat || (() => {
+    const m = (terrain.materials?.deadLeaves || terrain.materials?.roughRock || terrain.materials?.floor).clone();
+    m.color = new THREE.Color(0xffffff);
+    m.roughness = 0.95;
+    return m;
+  })();
+
+  const litterMat = silhouetteMat || (() => {
+    const m = (terrain.materials?.deadLeaves || terrain.materials?.bark || terrain.materials?.floor).clone();
+    m.color = new THREE.Color(litterBase);
+    m.roughness = 1.0;
+    return m;
+  })();
+
+  // --- placement pass: jittered grid, density-gated, archetype-weighted ----
+  // Coarser than the old tier system (4.4m -> 5.6m) and, per archetype, a
+  // single always-full-detail geometry rather than a cheap distance-LOD
+  // variant -- every tree placed now has real branch/canopy structure, so
+  // total tree count (not per-tree cost) is the budget lever.
+  const cellSize = 5.6;
   const cells = Math.round(worldSize / cellSize);
-  const NEAR_PATH_RADIUS = 26, NEAR_EDGE_MAX = 0.12;
-
-  const fullXf = fullVariants.map(() => []);
-  const snappedXf = snappedVariants.map(() => []);
-  const massXf = massVariants.map(() => []);
-  let totalFull = 0, totalSnapped = 0, totalMass = 0;
+  const archXf = archetypes.map(() => []); // [{ m, hueT }]
+  const litterXf = [];
+  const counts = Object.fromEntries(archetypes.map((a) => [a.name, 0]));
 
   for (let j = 0; j < cells; j++) {
     for (let i = 0; i < cells; i++) {
-      const jitterX = rng.range(-0.5, 0.5);
-      const jitterZ = rng.range(-0.5, 0.5);
-      const wx = (i + 0.5 + jitterX) * cellSize;
-      const wz = (j + 0.5 + jitterZ) * cellSize;
+      const wx = (i + 0.5 + rng.range(-0.5, 0.5)) * cellSize;
+      const wz = (j + 0.5 + rng.range(-0.5, 0.5)) * cellSize;
       if (wx < 1 || wz < 1 || wx > worldSize - 1 || wz > worldSize - 1) continue;
 
       const pathDist = nearestPathDist(terrain, wx, wz);
       const density = treeDensityAt(terrain, wx, wz, pathDist);
       if (rng.next() >= density) continue;
 
-      const edge = terrain.edgeAt(wx, wz);
-      const nearTier = pathDist < NEAR_PATH_RADIUS && edge < NEAR_EDGE_MAX;
-
+      // Pick ONCE, then locate it. Calling pickArchetype() inside the
+      // findIndex predicate re-rolls a different archetype per comparison, so
+      // the match depends on which element happens to be tested when the roll
+      // lands -- and returns -1 whenever none does. ARCHETYPES and this local
+      // list are 1:1 by construction, so indexOf is exact.
+      const picked = pickArchetype(rng);
+      const archIdx = Math.max(0, ARCHETYPES.indexOf(picked));
+      const arch = archetypes[archIdx];
       const groundY = terrain.heightAt(wx, wz);
       const yaw = rng.range(0, Math.PI * 2);
-      const scale = rng.range(0.78, 1.28);
+      const scale = rng.range(0.8, 1.3);
 
-      if (!nearTier) {
-        const lean = rng.range(0, 0.08);
-        const leanDir = rng.range(0, Math.PI * 2);
-        const q = new THREE.Quaternion();
-        const qYaw = new THREE.Quaternion().setFromAxisAngle(_up, yaw);
-        const leanAxis = new THREE.Vector3(Math.cos(leanDir), 0, Math.sin(leanDir));
-        const qLean = new THREE.Quaternion().setFromAxisAngle(leanAxis, lean);
-        q.multiplyQuaternions(qLean, qYaw);
-        const m = new THREE.Matrix4().compose(new THREE.Vector3(wx, groundY, wz), q, new THREE.Vector3(scale, scale, scale));
-        massXf[rng.int(0, massVariants.length - 1)].push({ m, tint: rng.range(-0.06, 0.08) });
-        totalMass++;
-        continue;
-      }
-
-      const snapped = rng.bool(0.18);
-      const lean = snapped ? rng.range(0.08, 0.28) : (rng.bool(0.22) ? rng.range(0.18, 0.42) : rng.range(0, 0.1));
+      // Per-instance lean variance: 2-4 degrees baseline (spec), plus an
+      // occasional dramatic topple so the blighted read isn't uniform --
+      // the bend itself lives in the archetype geometry, this is the
+      // instance-level tilt on top of it.
+      const dramatic = rng.bool(0.1);
+      const leanDeg = rng.range(2, 4) + (dramatic ? rng.range(8, 22) : 0);
+      const leanRad = THREE.MathUtils.degToRad(leanDeg);
       const leanDir = rng.range(0, Math.PI * 2);
-
-      const q = new THREE.Quaternion();
       const qYaw = new THREE.Quaternion().setFromAxisAngle(_up, yaw);
       const leanAxis = new THREE.Vector3(Math.cos(leanDir), 0, Math.sin(leanDir));
-      const qLean = new THREE.Quaternion().setFromAxisAngle(leanAxis, lean);
-      q.multiplyQuaternions(qLean, qYaw);
+      const qLean = new THREE.Quaternion().setFromAxisAngle(leanAxis, leanRad);
+      const q = new THREE.Quaternion().multiplyQuaternions(qLean, qYaw);
       const m = new THREE.Matrix4().compose(new THREE.Vector3(wx, groundY, wz), q, new THREE.Vector3(scale, scale, scale));
-      const entry = { m, tint: rng.range(-0.06, 0.08) };
 
-      if (snapped) {
-        snappedXf[rng.int(0, snappedVariants.length - 1)].push(entry);
-        totalSnapped++;
-      } else {
-        fullXf[rng.int(0, fullVariants.length - 1)].push(entry);
-        totalFull++;
-        if (scale > 0.95) terrain.markSolidDisc(wx, wz, 0.32 * scale);
+      const hueT = rng.range(-1, 1);
+      archXf[archIdx].push({ m, hueT });
+      counts[arch.name]++;
+      if (scale > 1.0) terrain.markSolidDisc(wx, wz, 0.32 * scale);
+
+      // Leaf litter under canopy: only where there is a canopy to drop it.
+      if (arch.geo.canopy && rng.bool(0.7)) {
+        const litterScale = scale * arch.geo.height * 0.12;
+        const litterM = new THREE.Matrix4().compose(
+          new THREE.Vector3(wx, groundY + 0.01, wz),
+          new THREE.Quaternion().setFromAxisAngle(_up, rng.range(0, Math.PI * 2)),
+          new THREE.Vector3(litterScale, 1, litterScale)
+        );
+        litterXf.push({ m: litterM, color: jitterFromBase(litterBase, rng.range(-1, 1), { hue: 0.03, sat: 0.15, light: 0.2 }) });
       }
     }
   }
 
-  for (let v = 0; v < fullVariants.length; v++) {
-    const trunkMesh = makeInstancedMesh(fullVariants[v].trunk, barkMat, fullXf[v], `TreeTrunkFull${v}`);
-    group.add(trunkMesh);
-    if (fullVariants[v].canopy) {
-      group.add(makeInstancedMesh(fullVariants[v].canopy, leafMat, fullXf[v], `TreeCanopy${v}`));
-    }
+  // --- the landmark: one hand-placed dead great-tree, bigger and unique,
+  // folded into the split-trunk archetype's own instance list (not a new
+  // draw call) at the authored fork clearing. ------------------------------
+  const landmarkIdx = archetypes.findIndex((a) => a.name === 'splitTrunk');
+  if (landmarkIdx >= 0) {
+    const gtPos = terrain.path.fork;
+    const gtY = terrain.heightAt(gtPos.x, gtPos.z);
+    const gtScale = 2.35;
+    const gtYaw = rng.range(0, Math.PI * 2);
+    const gtM = new THREE.Matrix4().compose(
+      new THREE.Vector3(gtPos.x, gtY, gtPos.z),
+      new THREE.Quaternion().setFromAxisAngle(_up, gtYaw),
+      new THREE.Vector3(gtScale, gtScale, gtScale)
+    );
+    archXf[landmarkIdx].push({ m: gtM, hueT: -1 });
+    counts.splitTrunk++;
+    terrain.markSolidDisc(gtPos.x, gtPos.z, 1.6 * gtScale * 0.4);
   }
-  for (let v = 0; v < snappedVariants.length; v++) {
-    group.add(makeInstancedMesh(snappedVariants[v].trunk, barkMat, snappedXf[v], `TreeTrunkSnapped${v}`));
-  }
-  for (let v = 0; v < massVariants.length; v++) {
-    group.add(makeInstancedMesh(massVariants[v].trunk, massBarkMat, massXf[v], `TreeTrunkMass${v}`));
-    if (massVariants[v].canopy) {
-      group.add(makeInstancedMesh(massVariants[v].canopy, massLeafMat, massXf[v], `TreeCanopyMass${v}`));
+
+  // --- instance + draw: one trunk mesh + (optional) one canopy mesh per
+  // archetype, regardless of how many instances landed in it. -------------
+  let drawCalls = 0;
+  for (let a = 0; a < archetypes.length; a++) {
+    const { geo, name } = archetypes[a];
+    const xfs = archXf[a];
+    const trunkXf = xfs.map((e) => ({ m: e.m, color: jitterFromBase(barkBase, e.hueT) }));
+    group.add(makeInstancedMesh(geo.trunk, barkMat, trunkXf, `Tree_${name}_Trunk`));
+    drawCalls++;
+    if (geo.canopy) {
+      const canopyXf = xfs.map((e) => ({ m: e.m, color: jitterFromBase(leafBase, e.hueT) }));
+      group.add(makeInstancedMesh(geo.canopy, leafMat, canopyXf, `Tree_${name}_Canopy`));
+      drawCalls++;
     }
   }
 
-  // --- the landmark: one hand-placed dead great-tree, bigger and unique ---
-  const landmark = buildFullTreeGeometry(rng.fork ? rng.fork('greattree') : rng);
-  const gtScale = 2.35;
-  const gtPos = terrain.path.fork;
-  const gtY = terrain.heightAt(gtPos.x, gtPos.z);
-  const gtGroup = new THREE.Group();
-  gtGroup.name = 'DeadGreatTree';
-  const gtTrunk = new THREE.Mesh(landmark.trunk, barkMat.clone());
-  gtTrunk.material.color = new THREE.Color(0x2e2a22);
-  gtTrunk.castShadow = true; gtTrunk.receiveShadow = true;
-  gtGroup.add(gtTrunk);
-  if (landmark.canopy) {
-    const gtCanopy = new THREE.Mesh(landmark.canopy, leafMat.clone());
-    gtCanopy.material.color = new THREE.Color(0x4b5536);
-    gtCanopy.castShadow = true;
-    gtGroup.add(gtCanopy);
-  }
-  gtGroup.position.set(gtPos.x, gtY, gtPos.z);
-  gtGroup.scale.setScalar(gtScale);
-  group.add(gtGroup);
-  terrain.markSolidDisc(gtPos.x, gtPos.z, 1.6 * gtScale * 0.4);
-
-  const drawCalls = fullVariants.length + fullVariants.filter((v) => v.canopy).length
-    + snappedVariants.length
-    + massVariants.length + massVariants.filter((v) => v.canopy).length
-    + (landmark.canopy ? 2 : 1);
+  const litterGeo = buildLeafLitterGeometry(rng.fork ? rng.fork('litter') : rng);
+  group.add(makeInstancedMesh(litterGeo, litterMat, litterXf, 'LeafLitter'));
+  drawCalls++;
 
   return {
     group,
-    counts: { full: totalFull, snapped: totalSnapped, mass: totalMass, greatTree: 1 },
+    counts: { ...counts, leafLitter: litterXf.length },
     drawCalls,
   };
 }
 
 // ---------------------------------------------------------------------------
-// LOD note
+// ground: leaf-litter scatter under canopies
 // ---------------------------------------------------------------------------
-// This file has no access to the camera: `world/zones/index.js` calls
-// `zone.update(dt)` with no second argument (see ARCHITECTURE.md's update
-// phase order), and the `ctx` a zone factory receives at construction
-// (`{ scene, rng, materials, lighting, quality }`) doesn't carry one either.
-// The near/mass split above is therefore keyed on build-time proximity to
-// the authored route rather than the live camera position, which is a
-// reasonable proxy here (gameplay keeps the camera near the player, and the
-// player spends most of its time on or near the trail) but is not true
-// distance LOD -- a tree placed far from the trail but that the player later
-// stands next to (chasing a monster spawn, say) stays cheap even close up.
-// If `main.js` (core-owned) ever threads `world` (which carries `camera`)
-// into `zone.update(dt, world)`, this file could upgrade to real per-frame
-// distance culling/swapping without any other change.
 
+/** A small overlapping scatter of flat dead-leaf flecks -- one merged
+ * geometry instanced once per canopied tree, at a scale keyed to that tree's
+ * canopy footprint. Cheap: ~10-14 flattened boxes, ~2 triangles each. */
+function buildLeafLitterGeometry(rng) {
+  const parts = [];
+  const n = 9 + rng.int(0, 6);
+  for (let i = 0; i < n; i++) {
+    const a = rng.range(0, Math.PI * 2);
+    const r = Math.sqrt(rng.next()) * rng.range(0.7, 1.0);
+    const x = Math.cos(a) * r, z = Math.sin(a) * r;
+    const s = rng.range(0.1, 0.22);
+    const rotY = rng.range(0, Math.PI * 2);
+    parts.push(box(s, 0.012, s * rng.range(0.55, 1.0), x, 0.006, z, rotY));
+  }
+  return merge(parts);
+}
 
+// ---------------------------------------------------------------------------
+// instancing
+// ---------------------------------------------------------------------------
 
 export function makeInstancedMesh(geo, mat, transforms, name) {
   const count = Math.max(1, transforms.length);
@@ -471,9 +314,13 @@ export function makeInstancedMesh(geo, mat, transforms, name) {
   const color = new THREE.Color();
   for (let i = 0; i < transforms.length; i++) {
     mesh.setMatrixAt(i, transforms[i].m);
-    const t = 1 + (transforms[i].tint ?? 0);
-    color.setRGB(t, t, t);
-    mesh.setColorAt(i, color);
+    if (transforms[i].color) {
+      mesh.setColorAt(i, transforms[i].color);
+    } else {
+      const t = 1 + (transforms[i].tint ?? 0);
+      color.setRGB(t, t, t);
+      mesh.setColorAt(i, color);
+    }
   }
   if (transforms.length === 0) mesh.count = 0;
   mesh.instanceMatrix.needsUpdate = true;
@@ -483,7 +330,7 @@ export function makeInstancedMesh(geo, mat, transforms, name) {
 }
 
 // ---------------------------------------------------------------------------
-// undergrowth: ferns, dead shrubs, dead-grass tufts
+// undergrowth: ferns, dead shrubs, dead-grass tufts, fallen logs, root snags
 // ---------------------------------------------------------------------------
 
 /** A small cluster of thin curled blades radiating from a point. */
@@ -499,7 +346,7 @@ function buildBladeClusterGeometry(rng, { count, height, curl, width }) {
       h * Math.cos(lean),
       from.z + Math.sin(a) * Math.sin(lean) * h
     );
-    const seg = orientedSegment(width * 0.02, width * 0.09, from, to, 3);
+    const seg = segment(width * 0.02, width * 0.09, from, to, 3);
     if (seg) parts.push(seg);
   }
   return merge(parts);
@@ -509,17 +356,18 @@ function buildFallenLogGeometry(rng) {
   const len = rng.range(2.2, 4.2);
   const r = rng.range(0.18, 0.3);
   const parts = [
-    cylinder(r, r * 1.08, len, 7, 0, r, 0, 0, Math.PI / 2),
-    // cracked, slightly collapsed cross-section at one end
-    sphere(r * 0.92, 6, 5, len / 2, r, 0, 0.8),
-    sphere(r * 0.9, 6, 5, -len / 2, r, 0, 0.8),
+    (function cyl() {
+      const from = new THREE.Vector3(-len / 2, r, 0);
+      const to = new THREE.Vector3(len / 2, r, 0);
+      return segment(r, r * 1.08, from, to, 7, false);
+    })(),
   ];
   const n = 2 + rng.int(0, 2);
   for (let i = 0; i < n; i++) {
     const x = rng.range(-len * 0.4, len * 0.4);
     parts.push(box(r * 0.5, r * 0.35, r * 1.7, x, r * 1.7, rng.range(-r * 0.3, r * 0.3), rng.range(0, Math.PI)));
   }
-  return merge(parts);
+  return merge(parts.filter(Boolean));
 }
 
 function buildRootSnagGeometry(rng) {
@@ -530,7 +378,7 @@ function buildRootSnagGeometry(rng) {
     const len = rng.range(0.5, 1.1);
     const from = new THREE.Vector3(0, 0.05, 0);
     const to = new THREE.Vector3(Math.cos(a) * len, len * rng.range(0.15, 0.4), Math.sin(a) * len);
-    const seg = orientedSegment(0.03, 0.11, from, to, 5);
+    const seg = segment(0.03, 0.11, from, to, 5);
     if (seg) parts.push(seg);
   }
   return merge(parts);
@@ -551,14 +399,16 @@ export function buildUndergrowth({ rng, terrain }) {
   group.name = 'Undergrowth';
   const worldSize = terrain.worldSize;
 
-  const fernMat = (terrain.materials?.deadLeaves || terrain.materials?.roughRock || terrain.materials?.floor).clone();
-  fernMat.color = new THREE.Color(0x616a44);
-  const shrubMat = (terrain.materials?.bark || terrain.materials?.woodBeams || terrain.materials?.floor).clone();
-  shrubMat.color = new THREE.Color(0x342f26);
-  const logMat = shrubMat.clone();
-  logMat.color = new THREE.Color(0x3c3629);
-  const rootMat = shrubMat.clone();
-  rootMat.color = new THREE.Color(0x2c281f);
+  const silhouetteMat = SILHOUETTE_MODE ? new THREE.MeshBasicMaterial({ color: 0x000000, fog: false }) : null;
+
+  const fernMat = silhouetteMat || (terrain.materials?.deadLeaves || terrain.materials?.roughRock || terrain.materials?.floor).clone();
+  if (!silhouetteMat) fernMat.color = new THREE.Color(0x616a44);
+  const shrubMat = silhouetteMat || (terrain.materials?.bark || terrain.materials?.woodBeams || terrain.materials?.floor).clone();
+  if (!silhouetteMat) shrubMat.color = new THREE.Color(0x342f26);
+  const logMat = silhouetteMat || shrubMat.clone();
+  if (!silhouetteMat) logMat.color = new THREE.Color(0x3c3629);
+  const rootMat = silhouetteMat || shrubMat.clone();
+  if (!silhouetteMat) rootMat.color = new THREE.Color(0x2c281f);
 
   const fernGeo = buildBladeClusterGeometry(rng, { count: 6, height: 0.55, curl: 0.9, width: 0.5 });
   const tuftGeo = buildBladeClusterGeometry(rng, { count: 8, height: 0.35, curl: 0.55, width: 0.4 });
@@ -570,7 +420,7 @@ export function buildUndergrowth({ rng, terrain }) {
       const len = rng.range(0.35, 0.75);
       const from = new THREE.Vector3(0, 0.05, 0);
       const to = new THREE.Vector3(Math.cos(a) * len * 0.5, len, Math.sin(a) * len * 0.5);
-      const seg = orientedSegment(0.02, 0.05, from, to, 4);
+      const seg = segment(0.02, 0.05, from, to, 4);
       if (seg) parts.push(seg);
     }
     return merge(parts);
