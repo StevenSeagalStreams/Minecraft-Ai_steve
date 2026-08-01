@@ -133,7 +133,8 @@ async function main() {
   });
 
   try {
-    const context = await browser.newContext({ viewport: { width: 1280, height: 720 }, deviceScaleFactor: 1 });
+    const W = Number(args.width ?? 640), H = Number(args.height ?? 360);
+    const context = await browser.newContext({ viewport: { width: W, height: H }, deviceScaleFactor: 1 });
     const page = await context.newPage();
     const logs = [];
     page.on('console', (m) => { if (m.type() === 'error') logs.push(`[console] ${m.text()}`); });
@@ -143,6 +144,14 @@ async function main() {
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 180000 });
     await page.waitForFunction(() => window.__ready === true, { timeout: 120000 });
     await page.evaluate(() => document.getElementById('boot')?.remove());
+    // Frame in close on the player, where the demo hook centres every effect.
+    await page.evaluate(() => {
+      const g = window.__game;
+      g.rig.distance = 15;
+      g.rig.elevation = 0.4;
+      g.rig.updateOffset();
+      g.rig.snapTo(g.player.position);
+    });
     await page.waitForTimeout(2200); // let the demo hook fire its first rotation
 
     const report = await page.evaluate(() => {
