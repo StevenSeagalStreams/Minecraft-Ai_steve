@@ -108,16 +108,20 @@ export async function createForest(ctx) {
       highlightTint: [1.00, 0.82, 0.52], highlightAmt: 0.16,
       vignette: 0.66,
     },
+    // Measured values, not taste. At 14 degrees the sun grazes flat ground --
+    // NdotL = sin(14) = 0.24 -- which against this terrain's albedo produced a
+    // frame that no exposure setting could rescue. 36 degrees gives NdotL 0.59
+    // and still casts long, characterful shadows.
     lightRig: {
       sunColor: 0xffb066,
-      sunIntensity: 2.6,
-      sunElevation: 14,     // degrees above horizon -- long raking shadows
+      sunIntensity: 9.5,
+      sunElevation: 36,
       sunAzimuth: 232,
       ambientColor: 0x36434c,
-      ambientIntensity: 0.55,
+      ambientIntensity: 1.0,
       hemiSky: 0x53606b,
       hemiGround: 0x241f18,
-      hemiIntensity: 0.75,
+      hemiIntensity: 1.35,
     },
     update(dt) {
       dressing.update?.(dt);

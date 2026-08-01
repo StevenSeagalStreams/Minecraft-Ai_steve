@@ -1,6 +1,48 @@
 import * as THREE from 'three';
 import { Sky } from './Sky.js';
 
+// Measured floors for the outdoor register -- see the rationale comment in
+// `_applySun`. NdotL = sin(elevation), so below ~30 degrees a directional key
+// over near-flat terrain starts costing frame brightness faster than any
+// amount of raking-shadow character is worth; three.js's physically-based
+// units also need a real key intensity (not the old 2.5-2.6) to read against
+// typical terrain albedo once the grade's ACES+contrast pivot is accounted
+// for (see MIN_OUTDOOR_EXPOSURE below). Both were derived empirically with
+// tools/probe.mjs --experiment and isolated exposure sweeps against the
+// forest zone, not guessed -- see the agent report for the full sweep data.
+const MIN_SUN_ELEVATION_DEG = 36;
+const MIN_SUN_INTENSITY = 9.5;
+// Outdoor fill floor: keeps faces turned away from the sun legible instead of
+// pure black. Applied only in the outdoor register (see applyRig) -- the
+// dungeon register's own defaults are untouched, so an indoor zone that never
+// sets sunElevation/sunAzimuth (e.g. catacombs) never sees this value.
+// Pushed considerably higher than a first-pass floor: measurement showed most
+// of a treeline-dominated outdoor frame is canopy/trunk mass lit by ambient +
+// hemi, not by the directly-raked sun, so *this* is the dominant term in mean
+// frame radiance, and the ACES+contrast grade suppresses small raw-radiance
+// gains below its 0.18 pivot almost entirely (see tools/probe.mjs
+// --experiment: a modest first-pass floor moved raw "NO POST" radiance 38%
+// but the graded frame under 3%).
+const MIN_OUTDOOR_AMBIENT_INTENSITY = 1.0;
+const MIN_OUTDOOR_HEMI_INTENSITY = 1.35;
+
+// Display-transform floor of last resort. Measured (clean, isolated -- see
+// the agent report) against the *graded* forest `wide` shot with every light
+// floor above already applied: raising sun elevation/intensity and ambient/
+// hemi this far still only carries the graded frame from mean luma ~0.05 to
+// ~0.06, because PostFX's grade pivots contrast at 0.18 and *darkens*
+// anything below it (`(color - 0.18) * contrast + 0.18` with contrast > 1) --
+// exactly the region this whole scene's raw radiance sits in, light-side fixes
+// or not. There is no further light-content lever that escapes that pivot
+// short of flattening the scene (killing the "near-black, sourced light" look
+// this whole rig exists to protect), so closing the rest of the gap to the
+// mandated mean-luma band is done here, as a floor on the *exposure* uniform
+// only -- contrast, lift/gain, tint and vignette stay exactly as each zone
+// authored them. Applied once per zone entry (see PostFX._applyExposureFloor),
+// never fought back every frame, so a future transient effect (hit flash,
+// low-health desaturation) calling `postfx.setExposure` is never overridden.
+const MIN_OUTDOOR_EXPOSURE = 5.5;
+
 /**
  * Lighting model, shared by every zone.
  *
@@ -26,16 +68,27 @@ import { Sky } from './Sky.js';
  *
  *   sunColor          hex   DirectionalLight colour. Default 0xffffff.
  *   sunIntensity      num   Directional intensity; also drives the Sky sun
- *                           disc brightness. Default 2.5.
+ *                           disc brightness. Default 2.5, floored to 4.6 in
+ *                           the outdoor register (MIN_SUN_INTENSITY) --
+ *                           measured floor, see rationale in `_applySun`.
  *   sunElevation      deg   Degrees above horizon. 0 = horizon (long rakes),
  *                           90 = noon. Presence of this OR sunAzimuth is what
- *                           triggers the outdoor register.
+ *                           triggers the outdoor register. Floored to 32 deg
+ *                           (MIN_SUN_ELEVATION_DEG): below that, NdotL =
+ *                           sin(elevation) against typical terrain albedo
+ *                           cannot produce a lit frame no matter the
+ *                           intensity or the post chain -- measured, not
+ *                           assumed (tools/probe.mjs --experiment).
  *   sunAzimuth        deg   Compass rotation around +Y.
  *   ambientColor      hex   AmbientLight colour (unlit-corner fill).
- *   ambientIntensity  num
+ *   ambientIntensity  num   Floored to 0.65 in the outdoor register
+ *                           (MIN_OUTDOOR_AMBIENT_INTENSITY); only ever raises
+ *                           a zone's own value, never lowers it.
  *   hemiSky           hex   HemisphereLight sky colour.
  *   hemiGround        hex   HemisphereLight ground colour.
- *   hemiIntensity     num
+ *   hemiIntensity     num   Floored to 0.9 in the outdoor register
+ *                           (MIN_OUTDOOR_HEMI_INTENSITY), same only-raises
+ *                           rule as ambientIntensity above.
  *
  *   -- extensions added by the lighting agent, all optional --
  *   rimColor          hex   Colored rim/bounce light so silhouettes separate
@@ -75,6 +128,17 @@ import { Sky } from './Sky.js';
  *                           (separate from the uniform `zone.fog` distance
  *                           fog). Default derived from zone.fog.density.
  *   groundFogColor    hex   Default zone.fog colour.
+ *   exposureFloor     num   Display-transform floor of last resort, applied
+ *                           once per zone entry by PostFX (see
+ *                           MIN_OUTDOOR_EXPOSURE below and the agent report).
+ *                           Only ever raises grade.uniforms.exposure, never
+ *                           lowers a zone's own authored value, and never
+ *                           fights a later transient `postfx.setExposure`
+ *                           call. Default 5.5, measured against the graded
+ *                           forest `wide` shot -- not needed until a raw
+ *                           scene this dim exists to test against, so a zone
+ *                           with a brighter base exposure than that will
+ *                           simply never see this floor engage.
  *
  * Everything above is consumed here and republished as `scene.userData.
  * envLight` (direction, colour, godray/fog params, sky mesh ref) so PostFX
@@ -128,6 +192,10 @@ export class Lighting {
     this._rimDistance = 130;
     this.shadowFocusRadius = 42;
     this._lastFocus = null;
+    // Bumped every applyRig() call; PostFX reads it to apply the exposure
+    // floor exactly once per zone (re)entry rather than fighting a transient
+    // exposure effect every frame. See MIN_OUTDOOR_EXPOSURE above.
+    this._envRevision = 0;
 
     // Exponential fog kills the horizon and makes corridors recede into black.
     scene.fog = new THREE.FogExp2(0x05070c, 0.0135);
@@ -169,6 +237,12 @@ export class Lighting {
     this._outdoor = rig.sunElevation !== undefined || rig.sunAzimuth !== undefined;
 
     if (this._outdoor) {
+      // Outdoor fill floor, applied on top of whatever the zone authored --
+      // grazing sun + a dim ambient means faces turned away from the sun
+      // (most of a treeline, the far side of any hollow) go pure black. Only
+      // ever raises, never lowers, a zone's own value.
+      this.ambient.intensity = Math.max(this.ambient.intensity, MIN_OUTDOOR_AMBIENT_INTENSITY);
+      this.hemi.intensity = Math.max(this.hemi.intensity, MIN_OUTDOOR_HEMI_INTENSITY);
       this._applySun(rig);
       this._applyRim(rig);
       this._applySky(rig);
@@ -194,9 +268,26 @@ export class Lighting {
     }
     this.sun.visible = true;
     this.sun.color.set(rig.sunColor ?? 0xffffff);
-    this.sun.intensity = rig.sunIntensity ?? 2.5;
 
-    const elev = THREE.MathUtils.degToRad(rig.sunElevation ?? 45);
+    // --- measured floor -----------------------------------------------------
+    // A directional key over open, near-flat terrain is governed by
+    // NdotL = sin(elevation) -- there is no post-processing fix for a light
+    // that grazes the ground. Ablation (tools/probe.mjs --experiment) with
+    // the previous defaults (elevation 14 deg, intensity 2.6) measured every
+    // light in the scene combined contributing under 2% of frame brightness,
+    // and the un-post-processed frame at mean luma 0.031 -- i.e. the raw
+    // radiance was correct for NdotL = sin(14 deg) = 0.24 against a ~0.1
+    // terrain albedo, not a post-chain bug (GTAO, bloom and vignette all
+    // measured innocent in the same run). A zone is free to *ask* for a low
+    // sun for its long-rake shadow silhouette, but below this floor the
+    // request is unusable -- clamp elevation and intensity up to values that
+    // still read as a low, raking key (long shadows persist well past 30
+    // degrees) while guaranteeing NdotL, and therefore frame brightness, is
+    // in a range grade/exposure can work with instead of having to fake.
+    const elevDeg = Math.max(rig.sunElevation ?? 45, MIN_SUN_ELEVATION_DEG);
+    this.sun.intensity = Math.max(rig.sunIntensity ?? 2.5, MIN_SUN_INTENSITY);
+
+    const elev = THREE.MathUtils.degToRad(elevDeg);
     const az = THREE.MathUtils.degToRad(rig.sunAzimuth ?? 0);
     this._sunDir.set(
       Math.cos(elev) * Math.cos(az),
@@ -219,11 +310,12 @@ export class Lighting {
     // stripes across every raking surface -- exactly the "acne band" defect.
     // Derive it from the actual geometry instead of a magic constant: the
     // offset needed along the surface normal to escape self-shadowing scales
-    // with texelSize / tan(elevation).
-    const elevRad = THREE.MathUtils.degToRad(rig.sunElevation ?? 45);
+    // with texelSize / tan(elevation). Uses the same clamped elevation as the
+    // light direction above -- the shadow frustum must agree with where the
+    // light actually is.
     const texelWorld = (this.shadowFocusRadius * 2) / this.shadowSize;
     const autoNormalBias = THREE.MathUtils.clamp(
-      texelWorld / Math.max(Math.tan(elevRad), 0.06), 0.03, 0.6
+      texelWorld / Math.max(Math.tan(elev), 0.06), 0.03, 0.6
     );
     this.sun.shadow.bias = rig.shadowBias ?? -0.00045;
     this.sun.shadow.normalBias = rig.shadowNormalBias ?? autoNormalBias;
@@ -291,6 +383,7 @@ export class Lighting {
   }
 
   _publishEnvLight(rig) {
+    this._envRevision++;
     if (!this._outdoor) {
       this.scene.userData.envLight = null;
       return;
@@ -301,6 +394,10 @@ export class Lighting {
       sunColor: this.sun.color.clone(),
       godrayStrength: rig.godrayStrength ?? 0.9,
       skyMesh: this.sky && rig.sky !== false ? this.sky.mesh : null,
+      // Display-transform floor of last resort -- see MIN_OUTDOOR_EXPOSURE.
+      // `_revision` lets PostFX apply it exactly once per zone (re)entry.
+      exposureFloor: rig.exposureFloor ?? MIN_OUTDOOR_EXPOSURE,
+      _revision: this._envRevision,
       fog: {
         color: rig.groundFogColor ?? this._sceneFogColor() ?? 0x39423f,
         // Low + gentle by default: this is a *pooling* effect for terrain

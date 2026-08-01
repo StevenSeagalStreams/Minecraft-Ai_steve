@@ -97,10 +97,31 @@ try {
           g.scene.traverse((o) => {
             if (o.isLight) window.__snap.push({ o, i: o.intensity, v: o.visible, cs: o.castShadow });
           });
-          window.__snapExp = g.postfx?.grade?.uniforms?.exposure?.value;
+          // Every mutable knob a variant can touch must be snapshotted, or
+          // variants stack silently and each reading is measured against a
+          // different baseline than the one it claims.
+          const u = g.postfx?.grade?.uniforms;
+          window.__snapPost = {
+            exposure: u?.exposure?.value,
+            vignette: u?.vignette?.value,
+            contrast: u?.contrast?.value,
+            saturation: u?.saturation?.value,
+            gtao: g.postfx?.gtao?.enabled,
+            bloom: g.postfx?.bloom?.enabled,
+          };
         }
         for (const s of window.__snap) { s.o.intensity = s.i; s.o.visible = s.v; s.o.castShadow = s.cs; }
-        if (g.postfx?.grade) g.postfx.grade.uniforms.exposure.value = window.__snapExp;
+        const u = g.postfx?.grade?.uniforms;
+        const snap = window.__snapPost;
+        if (u) {
+          u.exposure.value = snap.exposure;
+          u.vignette.value = snap.vignette;
+          u.contrast.value = snap.contrast;
+          u.saturation.value = snap.saturation;
+        }
+        if (g.postfx?.gtao) g.postfx.gtao.enabled = snap.gtao;
+        if (g.postfx?.bloom) g.postfx.bloom.enabled = snap.bloom;
+        g.__nopost = false;
         // eslint-disable-next-line no-eval
         eval(m);
       }, [mutate]);

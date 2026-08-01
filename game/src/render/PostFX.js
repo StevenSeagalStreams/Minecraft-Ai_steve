@@ -210,12 +210,33 @@ export class PostFX {
     this._time = 0;
     this._sunWorld = new THREE.Vector3();
     this._sunClip = new THREE.Vector4();
+    // See _applyExposureFloor: tracks which Lighting.applyRig publish we have
+    // already reacted to, so the floor engages once per zone entry rather
+    // than fighting a transient setExposure every frame.
+    this._exposureFloorRevision = -1;
   }
 
   /** Push transient looks: hit flashes, low-health desaturation, level intros. */
   setExposure(v) { this.grade.uniforms.exposure.value = v; }
   setSaturation(v) { this.grade.uniforms.saturation.value = v; }
   setVignette(v) { this.grade.uniforms.vignette.value = v; }
+
+  /** Apply Lighting's outdoor exposure floor (scene.userData.envLight.
+   *  exposureFloor -- see the extensive comment on MIN_OUTDOOR_EXPOSURE in
+   *  Lighting.js) exactly once per zone entry, identified by the envLight
+   *  object's `_revision` stamp. Only ever raises the current exposure
+   *  uniform, and only reacts to a *new* revision, so it never re-stomps a
+   *  transient look (`setExposure` from a hit flash, low-health vignette,
+   *  etc.) applied after zone entry. */
+  _applyExposureFloor() {
+    const env = this.scene.userData.envLight;
+    if (!env || env.exposureFloor === undefined) return;
+    if (env._revision === this._exposureFloorRevision) return;
+    this._exposureFloorRevision = env._revision;
+    if (this.grade.uniforms.exposure.value < env.exposureFloor) {
+      this.grade.uniforms.exposure.value = env.exposureFloor;
+    }
+  }
 
   /** Feed the Volumetrics pass from whatever Lighting last published. Reads
    *  scene.userData rather than taking a direct reference so main.js never
@@ -253,6 +274,7 @@ export class PostFX {
     this.grade.uniforms.time.value = this._time;
     this.volumetrics.update(dt);
     this._updateVolumetrics();
+    this._applyExposureFloor();
   }
 
   setSize(w, h) {
