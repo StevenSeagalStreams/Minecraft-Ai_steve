@@ -19,8 +19,8 @@ export function box(w, h, d, cx = 0, cy = 0, cz = 0, rotY = 0) {
   return g;
 }
 
-export function cylinder(rt, rb, h, radial, cx = 0, cy = 0, cz = 0, rotY = 0, rotZ = 0) {
-  const g = new THREE.CylinderGeometry(rt, rb, h, radial);
+export function cylinder(rt, rb, h, radial, cx = 0, cy = 0, cz = 0, rotY = 0, rotZ = 0, openEnded = false) {
+  const g = new THREE.CylinderGeometry(rt, rb, h, radial, 1, openEnded);
   if (rotZ) g.rotateZ(rotZ);
   if (rotY) g.rotateY(rotY);
   g.translate(cx, cy, cz);

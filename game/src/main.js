@@ -197,12 +197,16 @@ class Game {
 
     // The zone decides where and what spawns; the loop only instantiates.
     for (const spawn of zone.spawns || []) {
+      // Pass only what the zone legitimately knows. Every combat stat comes
+      // from the per-kind profile in src/combat/MonsterProfiles.js, which is
+      // the single source of truth -- a flat fallback here would silently
+      // flatten the swarmer/skeleton split back into identical monsters.
+      // `height` stays per-spawn because it is harmless visual variety.
       const m = new Monster({
         kind: spawn.kind,
-        maxHealth: spawn.maxHealth ?? (spawn.kind === 'brute' ? 90 : 46),
         height: spawn.height ?? rng.range(1.6, 1.86),
+        ...(spawn.overrides || {}),
       });
-      m.health = m.maxHealth;
       m.position.copy(spawn.position);
       m.spawnPoint.copy(m.position);
       m.facing = m.targetFacing = rng.range(-Math.PI, Math.PI);
@@ -311,13 +315,22 @@ class Game {
     for (const e of this.entities) e.update(dt, this.world);
     resolveOverlaps(this.entities, 2);
 
-    // Reap corpses after they have had time to settle and fade.
-    for (let i = this.entities.length - 1; i >= 0; i--) {
-      const e = this.entities[i];
-      if (e.alive || e === this.player) continue;
-      if (e.deathTimer > 14) {
+    // Corpses persist. This is a Diablo rule, not an oversight: a field of
+    // bodies is the record of the fight you just had, and clearing it deletes
+    // the player's own evidence of progress. Entity never despawns itself, so
+    // this loop only enforces a hard ceiling to bound memory on very long
+    // sessions -- and it evicts the OLDEST corpses first, far from the player,
+    // rather than deleting whatever happens to be underfoot.
+    const corpses = [];
+    for (const e of this.entities) {
+      if (!e.alive && e !== this.player) corpses.push(e);
+    }
+    if (corpses.length > MAX_CORPSES) {
+      corpses.sort((a, b) => b.deathTimer - a.deathTimer);
+      for (const e of corpses.slice(0, corpses.length - MAX_CORPSES)) {
         e.dispose();
-        this.entities.splice(i, 1);
+        const i = this.entities.indexOf(e);
+        if (i >= 0) this.entities.splice(i, 1);
         const j = this.monsters.indexOf(e);
         if (j >= 0) this.monsters.splice(j, 1);
       }
@@ -345,6 +358,9 @@ class Game {
     );
   }
 }
+
+/** Hard ceiling on persistent corpses -- memory bound, not a fade timer. */
+const MAX_CORPSES = 120;
 
 const _v1 = new THREE.Vector3();
 

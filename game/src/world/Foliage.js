@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { box, cylinder, sphere, merge } from './GeoKit.js';
+import { smoothstep } from '../render/TextureGen.js';
 
 /**
  * Blighted-forest foliage: parametric trees (silhouette-mass first,
@@ -7,6 +8,16 @@ import { box, cylinder, sphere, merge } from './GeoKit.js';
  * the ground from reading as empty between them. Everything here ends up as
  * a small, fixed number of InstancedMesh draw calls no matter how many
  * thousand instances are scattered.
+ *
+ * Perf discipline (M1 fix pass): a tree is cheap on purpose. Trunk/branch
+ * segments are open-ended cylinders (the joints are all hidden inside the
+ * next segment or a canopy clump, so the end caps are wasted triangles) and
+ * canopies are a few large low-poly blobs rather than many small ones. A
+ * second, drastically cheaper "mass" tree variant is used for the sealed
+ * boundary treeline and anything far from the authored trail -- a crude
+ * static LOD keyed on proximity-to-route rather than camera distance, since
+ * the zone's update(dt) signature has no camera to measure against (see the
+ * note at the bottom of this file).
  */
 
 // ---------------------------------------------------------------------------
@@ -23,11 +34,13 @@ const _one = new THREE.Vector3(1, 1, 1);
  * the "tip" used to chain sub-branches/canopy is the same point the mesh
  * actually ends at.
  */
-function orientedSegment(rt, rb, from, to, radial = 6) {
+function orientedSegment(rt, rb, from, to, radial = 6, openEnded = true) {
   const dir = new THREE.Vector3().subVectors(to, from);
   const len = dir.length();
   if (len < 1e-5) return null;
-  const g = new THREE.CylinderGeometry(rt, rb, len, radial);
+  // Interior joints and branch tips are never seen end-on at this camera
+  // angle -- open-ended saves 2*radial triangles per segment for free.
+  const g = new THREE.CylinderGeometry(rt, rb, len, radial, 1, openEnded);
   g.translate(0, len / 2, 0);
   const q = new THREE.Quaternion().setFromUnitVectors(_up, dir.multiplyScalar(1 / len));
   g.applyMatrix4(new THREE.Matrix4().compose(from, q, _one));
@@ -38,11 +51,15 @@ function sphericalDir(yaw, rise) {
   return new THREE.Vector3(Math.sin(yaw) * Math.cos(rise), Math.sin(rise), Math.cos(yaw) * Math.cos(rise));
 }
 
-/** Root flare + tapered multi-segment trunk, shared by every tree variant. */
-function buildTrunkCore(rng, { height, baseR, segs = 3, bend = 0.35 }) {
+/** Root flare + tapered multi-segment trunk, shared by every tree variant.
+ * Two segments (was three) plus a flare -- at instance scale the third
+ * segment's extra bend read as noise, not shape. Every joint is open-ended
+ * except the final one (which the canopy/branches don't always fully cover
+ * from above, so it keeps a real cap). */
+function buildTrunkCore(rng, { height, baseR, segs = 2, bend = 0.35 }) {
   const parts = [];
   const flareH = height * 0.10;
-  parts.push(cylinder(baseR * 1.05, baseR * 2.15, flareH, 8, 0, flareH / 2, 0));
+  parts.push(cylinder(baseR * 1.05, baseR * 2.15, flareH, 6, 0, flareH / 2, 0, 0, true));
 
   let cur = new THREE.Vector3(0, flareH, 0);
   let r = baseR * 1.05;
@@ -54,7 +71,8 @@ function buildTrunkCore(rng, { height, baseR, segs = 3, bend = 0.35 }) {
       cur.y + segH,
       cur.z + rng.range(-1, 1) * bend * segH * 0.6
     );
-    const seg = orientedSegment(rNext, r, cur, next, 7);
+    const isTop = i === segs - 1;
+    const seg = orientedSegment(rNext, r, cur, next, 5, !isTop);
     if (seg) parts.push(seg);
     cur = next;
     r = rNext;
@@ -62,21 +80,23 @@ function buildTrunkCore(rng, { height, baseR, segs = 3, bend = 0.35 }) {
   return { parts, topY: cur.y, topR: r, topPos: cur };
 }
 
-/** A single tapered branch with 0-1 sub-branch, returns tip positions for
- * canopy attachment. */
+/** A single tapered branch with an occasional sub-branch, returns tip
+ * positions for canopy attachment. Thinner radial counts and a lower
+ * sub-branch rate than the original -- branches are silhouette mass, not
+ * close-inspection detail. */
 function buildBranch(rng, parts, origin, dirAngleY, riseAngle, len, r0) {
   const dir = sphericalDir(dirAngleY, riseAngle);
   const tip = origin.clone().addScaledVector(dir, len);
-  const seg = orientedSegment(r0 * 0.32, r0, origin, tip, 5);
+  const seg = orientedSegment(r0 * 0.32, r0, origin, tip, 4);
   if (seg) parts.push(seg);
 
-  if (rng.bool(0.55)) {
+  if (rng.bool(0.3)) {
     const subLen = len * rng.range(0.4, 0.6);
     const subYaw = dirAngleY + rng.range(-0.9, 0.9);
     const subRise = riseAngle + rng.range(0.1, 0.5);
     const subDir = sphericalDir(subYaw, subRise);
     const subTip = tip.clone().addScaledVector(subDir, subLen);
-    const sub = orientedSegment(r0 * 0.12, r0 * 0.38, tip, subTip, 4);
+    const sub = orientedSegment(r0 * 0.12, r0 * 0.38, tip, subTip, 3);
     if (sub) parts.push(sub);
     return [tip, subTip];
   }
@@ -84,30 +104,33 @@ function buildBranch(rng, parts, origin, dirAngleY, riseAngle, len, r0) {
 }
 
 /** A low-poly, chunky "clump" of dead/curled foliage -- faceted, not smooth,
- * so it reads as a silhouette mass rather than noisy detail. */
+ * so it reads as a silhouette mass rather than noisy detail. Fewer, larger
+ * blobs than the original cost about a third as much for the same visual
+ * bulk (radius bumped up to compensate for the lower count). */
 function buildCanopyClump(rng, cx, cy, cz, scale) {
   const parts = [];
-  const n = 2 + rng.int(0, 2);
+  const n = 1 + rng.int(0, 1);
   for (let i = 0; i < n; i++) {
-    const ox = rng.range(-0.35, 0.35) * scale;
-    const oy = rng.range(-0.2, 0.25) * scale;
-    const oz = rng.range(-0.35, 0.35) * scale;
-    const r = scale * rng.range(0.45, 0.75);
-    parts.push(sphere(r, 5, 4, cx + ox, cy + oy, cz + oz, 0.72));
+    const ox = rng.range(-0.3, 0.3) * scale;
+    const oy = rng.range(-0.15, 0.2) * scale;
+    const oz = rng.range(-0.3, 0.3) * scale;
+    const r = scale * rng.range(0.6, 0.95);
+    parts.push(sphere(r, 5, 3, cx + ox, cy + oy, cz + oz, 0.72));
   }
   return parts;
 }
 
 /** Full blighted tree: root flare, bent trunk, sparse branch hierarchy, a few
  * curled canopy clumps at some (not all) branch tips -- diseased sparseness
- * over a healthy full crown. */
+ * over a healthy full crown. Used only for placements near the authored
+ * route (see the LOD note below); this is the "near tier" tree. */
 export function buildFullTreeGeometry(rng) {
   const height = rng.range(6.5, 10.5);
   const baseR = rng.range(0.26, 0.4);
-  const core = buildTrunkCore(rng, { height: height * 0.62, baseR, segs: 3, bend: 0.5 });
+  const core = buildTrunkCore(rng, { height: height * 0.62, baseR, segs: 2, bend: 0.5 });
   const parts = [...core.parts];
 
-  const branchCount = 4 + rng.int(0, 3);
+  const branchCount = 3 + rng.int(0, 2);
   const canopyParts = [];
   let originY = core.topY * 0.55;
   for (let i = 0; i < branchCount; i++) {
@@ -129,7 +152,7 @@ export function buildFullTreeGeometry(rng) {
   // otherwise-fullest variant.
   if (rng.bool(0.4)) {
     const stubY = core.topY * rng.range(0.7, 0.92);
-    parts.push(cylinder(baseR * 0.05, baseR * 0.22, height * 0.1, 5, core.topPos.x * 0.4, stubY, core.topPos.z * 0.4, 0, rng.range(-0.3, 0.3)));
+    parts.push(cylinder(baseR * 0.05, baseR * 0.22, height * 0.1, 4, core.topPos.x * 0.4, stubY, core.topPos.z * 0.4, 0, rng.range(-0.3, 0.3), true));
   }
 
   return {
@@ -139,7 +162,9 @@ export function buildFullTreeGeometry(rng) {
   };
 }
 
-/** A snapped, dead trunk -- no canopy, jagged fracture at the break. */
+/** A snapped, dead trunk -- no canopy, jagged fracture at the break. Also a
+ * "near tier" variant (it's the cheaper of the two originally, but it still
+ * only spawns close to the route -- see the LOD note below). */
 export function buildSnappedTreeGeometry(rng) {
   const height = rng.range(3.0, 5.6);
   const baseR = rng.range(0.28, 0.44);
@@ -148,7 +173,7 @@ export function buildSnappedTreeGeometry(rng) {
 
   // Fractured top cap: a cluster of small shards angled outward from the
   // break point instead of a clean cylinder cap.
-  const shardN = 4 + rng.int(0, 3);
+  const shardN = 3 + rng.int(0, 2);
   for (let i = 0; i < shardN; i++) {
     const a = (i / shardN) * Math.PI * 2 + rng.range(-0.3, 0.3);
     const r = core.topR * rng.range(0.5, 0.95);
@@ -168,35 +193,98 @@ export function buildSnappedTreeGeometry(rng) {
   return { trunk: merge(parts), canopy: null, height };
 }
 
+/**
+ * "Mass tier" tree: a single tapered trunk cylinder plus one or two big
+ * canopy blobs -- no branch hierarchy at all. This is the LOD variant, used
+ * for the sealed boundary treeline and everything far from the authored
+ * route (see the note below `buildForestFoliage`). It costs roughly a tenth
+ * of a near-tier full tree but reads identically as silhouette mass at the
+ * range it is actually seen from.
+ */
+export function buildMassTreeGeometry(rng) {
+  const height = rng.range(6.0, 10.0);
+  const baseR = rng.range(0.24, 0.38);
+  const lean = rng.range(-0.6, 0.6) * height * 0.08;
+  const trunk = orientedSegment(
+    baseR * 0.18, baseR * 1.15,
+    new THREE.Vector3(0, 0, 0), new THREE.Vector3(lean, height * 0.6, lean * 0.6),
+    5, false
+  );
+  const canopyParts = buildCanopyClump(rng, lean * 1.3, height * 0.66, lean * 0.8, height * 0.24);
+  return {
+    trunk: merge([trunk]),
+    canopy: merge(canopyParts),
+    height,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // placement
 // ---------------------------------------------------------------------------
-
-function treeDensityAt(terrain, wx, wz) {
-  const slope = terrain.slopeAt(wx, wz);
-  const path = terrain.pathAt(wx, wz);
-  const water = terrain.waterAt(wx, wz);
-  const edge = terrain.edgeAt(wx, wz);
-  if (water > 0.3) return 0;
-  if (slope > 0.34) return 0.02;
-
-  // Patchy cover -- clearings and thickets, not a uniform lawn -- driven by
-  // the same low-frequency base noise the terrain used, phase-shifted so
-  // clearings don't line up 1:1 with hollows.
-  const u = wx / terrain.worldSize, v = wz / terrain.worldSize;
-  const cover = 0.35 + 0.65 * Math.pow(hashNoise(u * 5.3 + 11, v * 5.3 + 4), 1.4);
-
-  let d = cover;
-  d *= 1 - path * 0.94;
-  d = Math.max(d, edge * 0.92); // dense sealed treeline at the boundary
-  d *= 1 - THREE.MathUtils.clamp(slope * 1.6, 0, 0.6);
-  return THREE.MathUtils.clamp(d, 0, 1);
-}
 
 /** Cheap deterministic 2D hash-noise (no tiling requirement here). */
 function hashNoise(x, y) {
   const s = Math.sin(x * 127.1 + y * 311.7) * 43758.5453123;
   return s - Math.floor(s);
+}
+
+/** Straight-line distance to the nearest sample on the authored trail
+ * polyline. O(samples) per call -- only ever used at build time over a few
+ * thousand candidate cells, never per-frame. */
+function nearestPathDist(terrain, wx, wz) {
+  let best = Infinity;
+  const s = terrain.path.samples;
+  for (let i = 0; i < s.length; i++) {
+    const dx = wx - s[i].x, dz = wz - s[i].z;
+    const d2 = dx * dx + dz * dz;
+    if (d2 < best) best = d2;
+  }
+  return Math.sqrt(best);
+}
+
+/** 0 right at the Dead Great-Tree / shrine landmarks, ramping to 1 clear of
+ * them -- these are the two places the brief calls out by name for "pools of
+ * light", so they get an explicit carve rather than relying on the noise
+ * mask to happen to open up there. */
+function landmarkClearing(terrain, wx, wz) {
+  const fork = terrain.path.fork, shrine = terrain.path.shrine;
+  const dFork = Math.hypot(wx - fork.x, wz - fork.z);
+  const dShrine = Math.hypot(wx - shrine.x, wz - shrine.z);
+  return Math.min(smoothstep(dFork, 7, 17), smoothstep(dShrine, 6, 14));
+}
+
+/**
+ * Density is deliberately low and deliberately contrasty: thicket, clearing,
+ * thicket, never a uniform lawn. `pathDist` is threaded in from the caller
+ * (it is also used there to pick the LOD tier) so it is only computed once
+ * per candidate cell.
+ */
+function treeDensityAt(terrain, wx, wz, pathDist) {
+  const slope = terrain.slopeAt(wx, wz);
+  const water = terrain.waterAt(wx, wz);
+  const edge = terrain.edgeAt(wx, wz);
+  if (water > 0.3) return 0;
+  if (slope > 0.34) return 0.02;
+
+  // Low-frequency mask carves distinct thickets and clearings out of the
+  // interior -- sharp contrast (smoothstep, not a smooth gradient) so most
+  // cells sit near zero and only clustered patches rise toward the cap.
+  const u = wx / terrain.worldSize, v = wz / terrain.worldSize;
+  const clump = hashNoise(u * 3.0 + 11, v * 3.0 + 4);
+  const thicket = smoothstep(clump, 0.5, 0.7);
+  const fine = hashNoise(u * 9.3 + 51, v * 9.3 + 23);
+  let interior = thicket * (0.5 + 0.5 * fine) * 0.48; // cap: real clearings, not a closed canopy
+
+  // A real clearing corridor along the trail (wider than the literal path
+  // texture strip) and around the two landmarks -- this is what lets the low
+  // sun actually strike the ground the player walks on.
+  interior *= smoothstep(pathDist, 6, 15);
+  interior *= landmarkClearing(terrain, wx, wz);
+
+  const edgeDensity = edge * 0.44; // dense-*reading* sealed treeline at the boundary,
+  let d = Math.max(interior, edgeDensity);              // regardless of clearings
+  d *= 1 - THREE.MathUtils.clamp(slope * 1.6, 0, 0.6);
+  return THREE.MathUtils.clamp(d, 0, 1);
 }
 
 export function buildForestFoliage({ rng, terrain }) {
@@ -208,8 +296,17 @@ export function buildForestFoliage({ rng, terrain }) {
   // merging different trees' geometry into one buffer would stack every
   // variant on top of every instance, so variety has to live in the count of
   // draw calls (still tiny) rather than in a single shared buffer.
-  const fullVariants = [buildFullTreeGeometry(rng), buildFullTreeGeometry(rng), buildFullTreeGeometry(rng)];
-  const snappedVariants = [buildSnappedTreeGeometry(rng), buildSnappedTreeGeometry(rng)];
+  //
+  // Two LOD tiers: "near" (full branch hierarchy) for placements close to
+  // the authored route, where the player actually walks past them, and
+  // "mass" (trunk + one or two canopy blobs, ~a tenth of the cost) for the
+  // sealed boundary treeline and everything far from the route -- exactly
+  // the trees that only ever read as a distant silhouette. See the note at
+  // the end of this function for why this is proximity-keyed rather than
+  // true camera-distance LOD.
+  const fullVariants = [buildFullTreeGeometry(rng), buildFullTreeGeometry(rng)];
+  const snappedVariants = [buildSnappedTreeGeometry(rng)];
+  const massVariants = [buildMassTreeGeometry(rng), buildMassTreeGeometry(rng)];
 
   const barkMat = (terrain.materials?.bark || terrain.materials?.woodBeams || terrain.materials?.floor).clone();
   barkMat.color = new THREE.Color(0x38342a);
@@ -219,13 +316,24 @@ export function buildForestFoliage({ rng, terrain }) {
   leafMat.color = new THREE.Color(0x565f3e);
   leafMat.roughness = Math.min(1, (leafMat.roughness ?? 0.8));
 
+  const massBarkMat = barkMat.clone();
+  massBarkMat.color = new THREE.Color(0x322e25);
+  const massLeafMat = leafMat.clone();
+  massLeafMat.color = new THREE.Color(0x505936);
+
   // --- placement pass: jittered grid, density-gated, hard-filtered by nav --
-  const cellSize = 2.6;
+  // Coarser than the original (2.6m -> 4.4m): fewer candidate cells is most
+  // of how total tree count drops from ~3000+ to the 250-400 target: a
+  // closed canopy at 43 sqm/tree cannot pass any light, however cheap each
+  // individual tree is.
+  const cellSize = 4.4;
   const cells = Math.round(worldSize / cellSize);
+  const NEAR_PATH_RADIUS = 26, NEAR_EDGE_MAX = 0.12;
 
   const fullXf = fullVariants.map(() => []);
   const snappedXf = snappedVariants.map(() => []);
-  let totalFull = 0, totalSnapped = 0;
+  const massXf = massVariants.map(() => []);
+  let totalFull = 0, totalSnapped = 0, totalMass = 0;
 
   for (let j = 0; j < cells; j++) {
     for (let i = 0; i < cells; i++) {
@@ -235,13 +343,32 @@ export function buildForestFoliage({ rng, terrain }) {
       const wz = (j + 0.5 + jitterZ) * cellSize;
       if (wx < 1 || wz < 1 || wx > worldSize - 1 || wz > worldSize - 1) continue;
 
-      const density = treeDensityAt(terrain, wx, wz);
+      const pathDist = nearestPathDist(terrain, wx, wz);
+      const density = treeDensityAt(terrain, wx, wz, pathDist);
       if (rng.next() >= density) continue;
 
-      const snapped = rng.bool(0.16);
+      const edge = terrain.edgeAt(wx, wz);
+      const nearTier = pathDist < NEAR_PATH_RADIUS && edge < NEAR_EDGE_MAX;
+
       const groundY = terrain.heightAt(wx, wz);
       const yaw = rng.range(0, Math.PI * 2);
       const scale = rng.range(0.78, 1.28);
+
+      if (!nearTier) {
+        const lean = rng.range(0, 0.08);
+        const leanDir = rng.range(0, Math.PI * 2);
+        const q = new THREE.Quaternion();
+        const qYaw = new THREE.Quaternion().setFromAxisAngle(_up, yaw);
+        const leanAxis = new THREE.Vector3(Math.cos(leanDir), 0, Math.sin(leanDir));
+        const qLean = new THREE.Quaternion().setFromAxisAngle(leanAxis, lean);
+        q.multiplyQuaternions(qLean, qYaw);
+        const m = new THREE.Matrix4().compose(new THREE.Vector3(wx, groundY, wz), q, new THREE.Vector3(scale, scale, scale));
+        massXf[rng.int(0, massVariants.length - 1)].push({ m, tint: rng.range(-0.06, 0.08) });
+        totalMass++;
+        continue;
+      }
+
+      const snapped = rng.bool(0.18);
       const lean = snapped ? rng.range(0.08, 0.28) : (rng.bool(0.22) ? rng.range(0.18, 0.42) : rng.range(0, 0.1));
       const leanDir = rng.range(0, Math.PI * 2);
 
@@ -274,6 +401,12 @@ export function buildForestFoliage({ rng, terrain }) {
   for (let v = 0; v < snappedVariants.length; v++) {
     group.add(makeInstancedMesh(snappedVariants[v].trunk, barkMat, snappedXf[v], `TreeTrunkSnapped${v}`));
   }
+  for (let v = 0; v < massVariants.length; v++) {
+    group.add(makeInstancedMesh(massVariants[v].trunk, massBarkMat, massXf[v], `TreeTrunkMass${v}`));
+    if (massVariants[v].canopy) {
+      group.add(makeInstancedMesh(massVariants[v].canopy, massLeafMat, massXf[v], `TreeCanopyMass${v}`));
+    }
+  }
 
   // --- the landmark: one hand-placed dead great-tree, bigger and unique ---
   const landmark = buildFullTreeGeometry(rng.fork ? rng.fork('greattree') : rng);
@@ -298,14 +431,35 @@ export function buildForestFoliage({ rng, terrain }) {
   terrain.markSolidDisc(gtPos.x, gtPos.z, 1.6 * gtScale * 0.4);
 
   const drawCalls = fullVariants.length + fullVariants.filter((v) => v.canopy).length
-    + snappedVariants.length + (landmark.canopy ? 2 : 1);
+    + snappedVariants.length
+    + massVariants.length + massVariants.filter((v) => v.canopy).length
+    + (landmark.canopy ? 2 : 1);
 
   return {
     group,
-    counts: { full: totalFull, snapped: totalSnapped, greatTree: 1 },
+    counts: { full: totalFull, snapped: totalSnapped, mass: totalMass, greatTree: 1 },
     drawCalls,
   };
 }
+
+// ---------------------------------------------------------------------------
+// LOD note
+// ---------------------------------------------------------------------------
+// This file has no access to the camera: `world/zones/index.js` calls
+// `zone.update(dt)` with no second argument (see ARCHITECTURE.md's update
+// phase order), and the `ctx` a zone factory receives at construction
+// (`{ scene, rng, materials, lighting, quality }`) doesn't carry one either.
+// The near/mass split above is therefore keyed on build-time proximity to
+// the authored route rather than the live camera position, which is a
+// reasonable proxy here (gameplay keeps the camera near the player, and the
+// player spends most of its time on or near the trail) but is not true
+// distance LOD -- a tree placed far from the trail but that the player later
+// stands next to (chasing a monster spawn, say) stays cheap even close up.
+// If `main.js` (core-owned) ever threads `world` (which carries `camera`)
+// into `zone.update(dt, world)`, this file could upgrade to real per-frame
+// distance culling/swapping without any other change.
+
+
 
 export function makeInstancedMesh(geo, mat, transforms, name) {
   const count = Math.max(1, transforms.length);

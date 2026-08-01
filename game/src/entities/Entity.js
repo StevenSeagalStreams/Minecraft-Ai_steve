@@ -69,6 +69,9 @@ export class Entity {
 
     this._desired = new THREE.Vector3();
     this._tmp = new THREE.Vector3();
+
+    /** Distance accumulator for footstep fx -- see `_emitFootstepFx`. */
+    this._stepDist = 0;
   }
 
   setRig(rig, animOpts = {}) {
@@ -78,8 +81,15 @@ export class Entity {
     return this;
   }
 
+  /**
+   * Total planar motion, for animation gait-blending and footstep fx --
+   * includes the current knockback contribution (even though knockback is
+   * deliberately NOT folded into `velocity` for position integration, see
+   * `update()`) so a body sliding from a shove still reads as moving instead
+   * of idle-standing-while-drifting.
+   */
   get speed() {
-    return Math.hypot(this.velocity.x, this.velocity.z);
+    return Math.hypot(this.velocity.x + this.knockback.x, this.velocity.z + this.knockback.z);
   }
 
   setPath(waypoints) {
@@ -167,6 +177,31 @@ export class Entity {
       attacker: source, victim: this, amount: dealt, direction: opts.direction ?? null, crit: result.crit,
     });
 
+    // fx:request -- see ARCHITECTURE.md's bus contract. Combat never imports
+    // src/fx; it only describes *what happened* (kind/position/direction/
+    // scale) and leaves how it looks to the vfx pillar. Only fired for a hit
+    // that actually landed (dealt > 0) -- a 0-damage graze draws nothing.
+    if (dealt > 0 && this._world?.bus) {
+      const hitPos = { x: this.position.x, y: this.position.y + this.height * 0.55, z: this.position.z };
+      const fxDir = opts.direction ? { x: opts.direction.x, y: 0, z: opts.direction.z } : null;
+      // Armoured targets (skeleton/brute/the player) read as metal-on-metal;
+      // unarmoured ones (swarmer) read as flesh. One deterministic rule off
+      // stats we already have, no new per-entity flag needed.
+      const hitScale = Math.min(1.8, Math.max(0.35, 0.45 + heavyFrac * 1.1 + (result.crit ? 0.35 : 0)));
+      this._world.bus.emit('fx:request', {
+        kind: this.armor > 0 ? 'spark_metal' : 'blood_hit',
+        position: hitPos, direction: fxDir, scale: hitScale,
+      });
+      // Same "heavy or crit" threshold as hit-stop above -- the flash is the
+      // visual half of the same beat the freeze is the temporal half of.
+      if (result.crit || heavyFrac >= 0.16) {
+        const flashScale = Math.min(1.6, Math.max(0.5, (result.crit ? 1.0 : 0.6) + heavyFrac * 0.5));
+        this._world.bus.emit('fx:request', {
+          kind: 'impact_flash', position: hitPos, direction: fxDir, scale: flashScale,
+        });
+      }
+    }
+
     if (this.health <= 0) {
       this.health = 0;
       this._deathDirection = opts.direction ? { x: opts.direction.x, z: opts.direction.z } : null;
@@ -218,6 +253,22 @@ export class Entity {
     // Diablo rule: corpses persist. This entity does not despawn itself on a
     // timer -- see the note in the mission report about main.js's reaper.
     this._world?.bus?.emit?.('combat:kill', { attacker: source, victim: this });
+
+    // fx:request -- always a "blood_kill", even for an armoured/bony target;
+    // the vfx pillar decides per-model whether that reads as blood, bone
+    // shards, or dust, this just marks "this is the kill beat". Direction
+    // reuses `this._collapse`'s already-resolved fallback (killing blow's
+    // direction, or facing if the kill had none) rather than re-deriving it.
+    if (this._world?.bus) {
+      const killPos = { x: this.position.x, y: this.position.y + this.height * 0.4, z: this.position.z };
+      const killScale = THREE.MathUtils.clamp(0.8 + forceFrac * 0.6, 0.8, 2.0);
+      this._world.bus.emit('fx:request', {
+        kind: 'blood_kill',
+        position: killPos,
+        direction: { x: this._collapse.dirX, y: 0, z: this._collapse.dirZ },
+        scale: killScale,
+      });
+    }
   }
 
   /** Steering toward the current path waypoint. Returns desired velocity. */
@@ -291,15 +342,25 @@ export class Entity {
     this.velocity.add(dv);
     this.velocity.y = 0;
 
-    // knockback decays fast; it is an impulse, not a state
+    // Knockback is a decaying *displacement* impulse, kept deliberately
+    // separate from `velocity` (steering's own target-tracking state) rather
+    // than folded into it. Folding it in used to mean: each frame re-adds
+    // whatever is left of the still-large, slowly-decaying knockback on top
+    // of a `velocity` that friction can only bleed off a little at a time --
+    // the two compounded into a multi-second, tens-of-metres runaway fling
+    // instead of a bounded shove (a light body could end up rocketing across
+    // the whole level from one crit). Contributing it only to *this frame's*
+    // position delta, then decaying it on its own, bounds the total knockback
+    // displacement to knockback0/9 (the decay constant below) regardless of
+    // friction -- a real shove, not a resonance.
+    const kx = this.knockback.x, kz = this.knockback.z;
     if (this.knockback.lengthSq() > 0.0001) {
-      this.velocity.add(this.knockback);
       this.knockback.multiplyScalar(Math.exp(-9 * sdt));
     }
 
     // --- collision-aware move ----------------------------------------------
-    const nx = this.position.x + this.velocity.x * sdt;
-    const nz = this.position.z + this.velocity.z * sdt;
+    const nx = this.position.x + (this.velocity.x + kx) * sdt;
+    const nz = this.position.z + (this.velocity.z + kz) * sdt;
     const colliders = world?.colliders;
 
     if (colliders) {
@@ -330,6 +391,38 @@ export class Entity {
     this.object.rotation.y = this.facing;
 
     this.animator?.update(sdt, { speed: this.speed, facing: this.facing });
+    this._emitFootstepFx(sdt);
+  }
+
+  /**
+   * fx:request('dust_step') -- distance-accumulated, not time-accumulated,
+   * so a sprinting swarmer kicks up dust more often than a plodding skeleton
+   * without any separate per-kind timer. Reads `animator.strideLength`
+   * (public field Animation.js already sets from the profile) rather than
+   * duplicating stride tuning here; a rig-less entity (tests) falls back to a
+   * sane default so this never throws.
+   */
+  _emitFootstepFx(sdt) {
+    if (!this._world?.bus) return;
+    // Total planar motion (steering velocity + any residual knockback), same
+    // basis as the `speed` getter -- using `velocity` alone here while
+    // thresholding/scaling off `speed` (which includes knockback) could
+    // produce a "moving" footstep with a near-zero direction vector.
+    const mx = this.velocity.x + this.knockback.x;
+    const mz = this.velocity.z + this.knockback.z;
+    const spd = Math.hypot(mx, mz);
+    if (spd < 0.25) { this._stepDist = 0; return; }
+    this._stepDist += spd * sdt;
+    const stride = Math.max(0.5, (this.animator?.strideLength ?? 1.4)) * 0.5;
+    if (this._stepDist < stride) return;
+    this._stepDist -= stride;
+    const speedFrac = THREE.MathUtils.clamp(spd / Math.max(0.1, this.moveSpeed), 0, 1.4);
+    this._world.bus.emit('fx:request', {
+      kind: 'dust_step',
+      position: { x: this.position.x, y: 0.02, z: this.position.z },
+      direction: { x: mx / spd, y: 0, z: mz / spd },
+      scale: THREE.MathUtils.clamp(0.4 + speedFrac * 0.7, 0.4, 1.2),
+    });
   }
 
   distanceTo(other) {

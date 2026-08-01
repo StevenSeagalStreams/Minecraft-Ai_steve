@@ -146,6 +146,29 @@ console.log('\n[3] knockback scales inversely with mass');
   brute.update(1 / 60, { colliders: null });
   check('a heavy hit throws a low-mass body (swarmer) meaningfully',
     Math.abs(swarmer.position.x) > Math.abs(brute.position.x) * 1.5);
+
+  // (d) knockback must be a BOUNDED shove, not an unbounded/resonant fling.
+  // Regression guard for a real bug this suite's own feeltest instrumentation
+  // caught: folding the decaying knockback vector permanently into `velocity`
+  // every frame (instead of only contributing it to that frame's position
+  // delta) compounded into a multi-second, hundreds-of-metres runaway from a
+  // single crit on a light body. Run a light body for many frames after one
+  // hit and check total displacement stays within a small, sane multiple of
+  // the theoretical impulse bound (force/mass / decayRate), never diverging.
+  HitStop.reset();
+  const flungLight = new Entity({ mass: 0.55, maxHealth: 1000, armor: 0, friction: 16 });
+  const flingForce = knockbackForce(30, { crit: true });
+  flungLight.applyKnockback(1, 0, flingForce);
+  const theoreticalBound = (flingForce / Math.max(0.2, flungLight.mass)) / 9; // matches the 9 in Entity's decay
+  for (let i = 0; i < 300; i++) flungLight.update(1 / 60, { colliders: null }); // 5 simulated seconds
+  check(`a single knockback impulse produces a bounded total displacement (got ${flungLight.position.x.toFixed(2)}m, bound ~${theoreticalBound.toFixed(2)}m)`,
+    flungLight.position.x < theoreticalBound * 3 && flungLight.position.x < 15);
+  // Entity.js stops multiplying the knockback vector once it's already below
+  // the "may as well be zero" epsilon guard (lengthSq < 0.0001, i.e. length
+  // < 0.01) rather than paying to decay an already-imperceptible residual
+  // forever -- so it settles just under that epsilon, not at exact 0.
+  check('knockback decays down to (and stays at) a negligible, imperceptible residual',
+    flungLight.knockback.length() < 0.01);
 }
 
 // ---------------------------------------------------------------------------
@@ -176,6 +199,41 @@ console.log('\n[4] hit-stop always releases, never permanently freezes the sim')
   HitStop.trigger(5, 0.04); // crit-tier freeze
   HitStop.trigger(1, 0.5);  // a trivial hit landing the same frame
   check('a weaker/shorter request does not shorten an in-flight freeze', HitStop.frames === 5);
+
+  // Overlapping hit-stops (e.g. a cleave that lands on two monsters the same
+  // frame, or a second hit landing mid-freeze) must EXTEND the freeze, not
+  // deadlock the counter or get lost. Prove this two ways: (a) a longer
+  // request arriving mid-freeze pushes the release further out than either
+  // request alone would have, and (b) hammering trigger() every single frame
+  // -- the worst-case "does this ever stop counting down" scenario -- still
+  // releases within a bounded number of frames after the requests stop.
+  HitStop.reset();
+  HitStop.trigger(3, 0.1);
+  HitStop.tickFrame();               // 1 frame burned -> 2 left
+  HitStop.tickFrame();               // 2 frames burned -> 1 left
+  check('mid-extend setup: 1 frame left before the overlapping trigger', HitStop.frames === 1);
+  HitStop.trigger(4, 0.1);           // a second, overlapping hit lands now
+  check('an overlapping request extends the freeze past where the first alone would have ended',
+    HitStop.frames === 4);
+  let extendBurned = 0;
+  while (HitStop.active && extendBurned < HITSTOP_MAX_FRAMES + 5) { HitStop.tickFrame(); extendBurned++; }
+  check('the extended freeze still releases within HITSTOP_MAX_FRAMES of its own extension',
+    extendBurned <= HITSTOP_MAX_FRAMES && !HitStop.active);
+
+  HitStop.reset();
+  // Worst case: something buggy re-triggers hit-stop every single frame for a
+  // while (e.g. a pack all landing hits on consecutive frames). The frame
+  // counter is clamped on every write, so this can never accumulate into an
+  // unbounded or permanent freeze -- it must still fully drain soon after the
+  // spam stops.
+  for (let i = 0; i < 50; i++) { HitStop.trigger(5, 0.05); HitStop.tickFrame(); }
+  check('hammering trigger() every frame for 50 frames never exceeds HITSTOP_MAX_FRAMES',
+    HitStop.frames <= HITSTOP_MAX_FRAMES);
+  let drainBurned = 0;
+  while (HitStop.active && drainBurned < HITSTOP_MAX_FRAMES + 5) { HitStop.tickFrame(); drainBurned++; }
+  check('once the spam stops, the sim is not permanently frozen -- it drains and releases',
+    drainBurned <= HITSTOP_MAX_FRAMES && !HitStop.active);
+  HitStop.reset();
 
   // Entity.update()/resolveOverlaps() integration: with hit-stop hard-frozen,
   // an entity with velocity should barely move, and resolveOverlaps() (which
@@ -219,6 +277,129 @@ console.log('\n[5] pack coordination (AggroPack) helpers');
   check('propagateAggro wakes an idle neighbour within radius', near.state === 'alert');
   check('propagateAggro leaves a distant idle monster alone', far.state === 'idle');
   check('propagateAggro returns exactly the monsters it woke', woken.length === 1 && woken[0] === near);
+}
+
+// ---------------------------------------------------------------------------
+console.log('\n[6] crit multiplier applies exactly once');
+// ---------------------------------------------------------------------------
+{
+  // Direct math check: a forced crit multiplies the mitigated damage by
+  // exactly critMultiplier -- not squared, not applied to armour, not
+  // applied twice by some second code path.
+  const base = 40;
+  const armor = 10;
+  const critMultiplier = 1.75;
+  const noCrit = computeDamage({ baseAmount: base, armor, critMultiplier, forceCrit: false });
+  const crit = computeDamage({ baseAmount: base, armor, critMultiplier, forceCrit: true });
+  const expectedMitigated = base * (1 - armorReduction(armor));
+  check('a non-crit hit deals exactly the mitigated amount (multiplier 1x)',
+    Math.abs(noCrit.amount - expectedMitigated) < 1e-9);
+  check('a forced crit deals exactly mitigated * critMultiplier, no more, no less',
+    Math.abs(crit.amount - expectedMitigated * critMultiplier) < 1e-9);
+  check('crit is not "double-applied": crit.amount / noCrit.amount === critMultiplier exactly',
+    Math.abs(crit.amount / noCrit.amount - critMultiplier) < 1e-9);
+
+  // End-to-end through Entity#damage(): even with the attacker rolling a
+  // guaranteed crit AND the victim's own multiplier set very differently,
+  // only the attacker's critMultiplier is used, applied exactly once, and
+  // the `crit` flag on the emitted combat:hit event is set exactly once.
+  let hitEvents = 0;
+  let lastAmount = 0;
+  const bus = { emit(type, payload) { if (type === 'combat:hit') { hitEvents++; lastAmount = payload.amount; } } };
+  const victim = new Entity({ maxHealth: 1000, armor: 10, critMultiplier: 99 /* must be ignored -- attacker's wins */ });
+  victim._world = { bus };
+  const attacker = { critChance: 1, critMultiplier: 2 };
+  const dealt = victim.damage(40, attacker, { crit: true });
+  const expected = 40 * (1 - armorReduction(10)) * 2;
+  check('Entity#damage applies the attacker\'s crit multiplier exactly once end-to-end',
+    Math.abs(dealt - expected) < 1e-6);
+  check('exactly one combat:hit event is emitted per damage() call', hitEvents === 1);
+  check('the emitted amount matches the returned amount (single source of truth)',
+    Math.abs(lastAmount - dealt) < 1e-9);
+}
+
+// ---------------------------------------------------------------------------
+console.log('\n[7] fx:request contract -- combat emits the documented vfx events');
+// ---------------------------------------------------------------------------
+{
+  const seen = [];
+  const bus = { emit(type, payload) { if (type === 'fx:request') seen.push(payload); } };
+
+  // (a) a non-lethal hit on an unarmoured target -> blood_hit, well-shaped
+  // payload, no spark, no kill.
+  HitStop.reset();
+  const swarmerLike = new Entity({ maxHealth: 200, armor: 0, height: 1.5 });
+  swarmerLike._world = { bus };
+  seen.length = 0;
+  swarmerLike.damage(10, { critChance: 0 }, { direction: { x: 1, z: 0 } });
+  const kinds = seen.map((e) => e.kind);
+  check('a hit on an unarmoured target requests blood_hit', kinds.includes('blood_hit'));
+  check('a hit on an unarmoured target does NOT request spark_metal', !kinds.includes('spark_metal'));
+  for (const e of seen) {
+    check(`fx:request(${e.kind}) has a well-shaped payload (position x/y/z, finite scale)`,
+      isCleanNumber(e.position?.x) && isCleanNumber(e.position?.y) && isCleanNumber(e.position?.z) &&
+      isCleanNumber(e.scale) && e.scale > 0);
+  }
+
+  // (b) a non-lethal hit on an armoured target -> spark_metal, not blood_hit.
+  HitStop.reset();
+  const skeletonLike = new Entity({ maxHealth: 200, armor: 6, height: 1.8 });
+  skeletonLike._world = { bus };
+  seen.length = 0;
+  skeletonLike.damage(10, { critChance: 0 }, { direction: { x: 1, z: 0 } });
+  const kinds2 = seen.map((e) => e.kind);
+  check('a hit on an armoured target requests spark_metal, not blood_hit',
+    kinds2.includes('spark_metal') && !kinds2.includes('blood_hit'));
+
+  // (c) a heavy/crit hit also requests impact_flash, on top of the blood/spark.
+  HitStop.reset();
+  const critTarget = new Entity({ maxHealth: 200, armor: 0 });
+  critTarget._world = { bus };
+  seen.length = 0;
+  critTarget.damage(20, { critChance: 0 }, { direction: { x: 1, z: 0 }, crit: true });
+  const kinds3 = seen.map((e) => e.kind);
+  check('a crit hit also requests impact_flash', kinds3.includes('impact_flash'));
+
+  // (d) a killing blow requests blood_kill, with a direction matching the
+  // collapse direction (the killing blow's direction).
+  HitStop.reset();
+  const dying = new Entity({ maxHealth: 20, armor: 0 });
+  dying._world = { bus };
+  seen.length = 0;
+  dying.damage(999, { critChance: 0 }, { direction: { x: -1, z: 0 } });
+  const killEvent = seen.find((e) => e.kind === 'blood_kill');
+  check('a killing blow requests blood_kill', !!killEvent);
+  check('blood_kill direction matches the killing blow\'s direction',
+    killEvent && Math.sign(killEvent.direction.x) === -1);
+
+  // (e) footstep dust: a moving entity eventually requests dust_step, a
+  // stationary one never does.
+  HitStop.reset();
+  // NB: update(dt, world) unconditionally sets `this._world = world` at the
+  // top (Entity.js needs the fresh reference every tick since damage() can
+  // be invoked outside of update() too) -- so the bus has to travel in via
+  // the `world` argument here, not a pre-set `_world`, or it gets clobbered.
+  const walker = new Entity({ moveSpeed: 4, acceleration: 1000, friction: 1000, maxHealth: 100 });
+  walker.setPath([{ x: 1000, z: 0 }]); // far waypoint -> steady desired velocity every frame
+  seen.length = 0;
+  for (let i = 0; i < 120; i++) walker.update(1 / 60, { colliders: null, bus }); // 2s of walking
+  const steps = seen.filter((e) => e.kind === 'dust_step');
+  check('a moving entity eventually requests dust_step', steps.length > 0);
+
+  const stillEntity = new Entity({ maxHealth: 100 });
+  seen.length = 0;
+  for (let i = 0; i < 60; i++) stillEntity.update(1 / 60, { colliders: null, bus });
+  check('a stationary entity never requests dust_step', seen.filter((e) => e.kind === 'dust_step').length === 0);
+
+  // (f) never lets a bad direction (0-length, NaN) escape as a bad payload --
+  // fx consumers should never have to defend against NaN from us.
+  HitStop.reset();
+  const nanDirVictim = new Entity({ maxHealth: 100, armor: 0 });
+  nanDirVictim._world = { bus };
+  seen.length = 0;
+  nanDirVictim.damage(10, { critChance: 0 }, {}); // no direction supplied at all
+  check('fx:request tolerates a hit with no direction (direction: null, not NaN)',
+    seen.every((e) => e.direction === null || (isCleanNumber(e.direction.x) && isCleanNumber(e.direction.z))));
 }
 
 // ---------------------------------------------------------------------------

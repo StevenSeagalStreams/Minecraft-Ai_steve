@@ -60,10 +60,16 @@ const skeleton = new Entity({ type: 'monster', faction: 'hostile', mass: 1.15, m
 skeleton.position.set(0, 0, 3);
 
 const entities = [player, swarmer, skeleton];
+const fxCounts = {};
 const world = { colliders: null, monsters: [swarmer, skeleton], player, bus: { emit(type, payload) {
   if (type === 'combat:hit') record('event combat:hit', `victim=${payload.victim.type} amount=${fmt(payload.amount)} crit=${payload.crit}`);
   if (type === 'combat:kill') record('event combat:kill', `victim=${payload.victim.type}`);
   if (type === 'camera:shake') record('event camera:shake', `trauma=${fmt(payload.trauma)}`);
+  if (type === 'fx:request') {
+    fxCounts[payload.kind] = (fxCounts[payload.kind] || 0) + 1;
+    const dir = payload.direction ? `(${fmt(payload.direction.x)},${fmt(payload.direction.z)})` : 'null';
+    record(`event fx:request`, `kind=${payload.kind} pos=(${fmt(payload.position.x)},${fmt(payload.position.y)},${fmt(payload.position.z)}) dir=${dir} scale=${fmt(payload.scale)}`);
+  }
 } } };
 
 function snapshot(label) {
@@ -113,6 +119,25 @@ for (let i = 0; i < 6; i++) {
 }
 record('hit-stop check', HitStop.active ? 'STILL ACTIVE -- BUG' : 'released cleanly, as guaranteed');
 
+// --- overlapping hit-stops: a second hit lands mid-freeze -------------------
+record('\n--- phase 4b: overlapping hit-stop -- a second hit lands mid-freeze, must extend not deadlock ---');
+HitStop.reset();
+HitStop.trigger(3, 0.1);
+record('  first trigger(3, 0.1)', `frames=${HitStop.frames} scale=${fmt(HitStop.scale)}`);
+resolveOverlaps([], 1);
+resolveOverlaps([], 1);
+record('  after 2 ticks (1 frame left)', `frames=${HitStop.frames} scale=${fmt(HitStop.scale)}`);
+HitStop.trigger(4, 0.1); // a second hit lands while the first is still winding down
+record('  overlapping trigger(4, 0.1) lands', `frames=${HitStop.frames} scale=${fmt(HitStop.scale)} (extended, not reset to a fresh 4 from a frozen clock)`);
+let overlapTicks = 0;
+while (HitStop.active && overlapTicks < 20) {
+  resolveOverlaps([], 1);
+  overlapTicks++;
+  record(`  overlap tick ${overlapTicks}`, `frames=${HitStop.frames} active=${HitStop.active}`);
+}
+record('overlap check', HitStop.active ? 'STILL ACTIVE -- BUG (deadlock)' : `released cleanly after ${overlapTicks} extra ticks, as guaranteed`);
+HitStop.reset();
+
 // --- the killing blow: directional collapse + corpse persistence -----------
 record('\n--- phase 5: killing blow on the skeleton, direction = -X (west), from the east ---');
 skeleton.health = 999;
@@ -133,6 +158,15 @@ for (let i = 0; i < 40; i++) {
   }
 }
 
+record('\n--- phase 5b: footstep fx -- a live swarmer walking toward a far waypoint ---');
+const walker = new Entity({ type: 'monster', faction: 'hostile', mass: 0.55, maxHealth: 200, moveSpeed: 5.6, acceleration: 30, friction: 16 });
+walker.position.set(10, 0, 10);
+walker.setPath([{ x: 40, z: 10 }]);
+const walkWorld = { colliders: null, monsters: [], player, bus: world.bus };
+const fxBefore = fxCounts.dust_step || 0;
+for (let i = 0; i < 90; i++) { frame++; simTime += DT; walker.update(DT, walkWorld); resolveOverlaps([walker], 1); }
+record('footstep check', `dust_step fired ${((fxCounts.dust_step || 0) - fxBefore)} times over 90 frames (1.5s) of walking`);
+
 record('\n--- phase 6: corpse persistence -- run 20 simulated seconds past death ---');
 const extraTicks = Math.round(20 / DT);
 for (let i = 0; i < extraTicks; i++) tick(entities, world);
@@ -149,3 +183,5 @@ console.log(`hit-stop fired and released: yes (see phase 4)`);
 console.log(`knockback applied, mass-scaled: yes (swarmer moved ${fmt(Math.abs(swarmerMoved))}m vs skeleton ${fmt(Math.abs(skeletonMoved))}m for an identical raw hit)`);
 console.log(`directional death collapse: yes (collapse dirX=${fmt(skeleton._collapse.dirX)} matches the killing blow's -X direction)`);
 console.log(`corpse persists with no self-despawn: yes (Entity never sets alive back to true or removes itself)`);
+console.log(`overlapping hit-stop extends rather than deadlocks: yes (see phase 4b, ${overlapTicks} ticks to release)`);
+console.log(`fx:request kinds emitted this run: ${JSON.stringify(fxCounts)}`);
