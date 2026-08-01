@@ -97,12 +97,14 @@ you need a change in someone else's file, note it in your report instead.
 
 | Owner | Files |
 | --- | --- |
-| core (orchestrator) | `src/main.js`, `src/core/*`, `ARCHITECTURE.md`, `tools/*` |
-| rendering | `src/render/Renderer.js`, `PostFX.js`, `CameraRig.js`, `Lighting.js`, `src/render/Sky.js` |
+| core (orchestrator) | `src/main.js`, `src/core/*`, `src/world/zones/index.js`, `ARCHITECTURE.md`, `CRITIC.md`, `tools/*` |
+| terrain & environment | `src/world/zones/forest.js`, `src/world/Terrain*.js`, `src/world/Foliage*.js`, `src/world/Props.js`, `src/world/GeoKit.js` |
+| dungeon world | `src/world/DungeonGen.js`, `LevelBuilder.js`, `Nav.js`, `src/world/zones/catacombs.js` |
+| lighting & atmosphere | `src/render/Lighting.js`, `PostFX.js`, `Renderer.js`, `CameraRig.js`, `src/render/Sky.js` |
 | materials | `src/render/TextureGen.js`, `src/render/Materials.js` |
-| world | `src/world/*` |
-| characters | `src/entities/CharacterRig.js`, `Models.js`, `Animation.js` |
-| combat | `src/entities/Entity.js`, `Player.js`, `Monster.js`, `src/combat/*`, `src/skills/*` |
+| characters | `src/entities/CharacterRig.js`, `Models.js`, `Animation.js`, `Cloth.js`, `GeoKit.js`, `CharacterTextures.js` |
+| enemies | `src/entities/monsters/*` |
+| combat & physics | `src/entities/Entity.js`, `Player.js`, `Monster.js`, `src/combat/*`, `src/skills/*` |
 | items | `src/items/*`, `src/progress/*` |
 | vfx | `src/fx/*` |
 | ui | `src/ui/*` |
@@ -110,6 +112,17 @@ you need a change in someone else's file, note it in your report instead.
 
 New files go inside your own directory. If you must add a hook in `main.js`,
 report the exact snippet rather than editing it.
+
+## Zones
+
+`src/world/zones/index.js` is the registry. A zone factory returns
+`{ name, group, colliders, nav, spawnPoint, bounds, spawns, fog, grade,
+lightRig, update(dt) }`. The game loop knows nothing about forests or
+catacombs -- it asks for a zone by name. Select with `?zone=forest|catacombs`.
+
+`grade` maps onto the PostFX grade uniforms and `lightRig` onto the Lighting
+rig, so each zone carries its own colour identity (the WoW pillar) without any
+subsystem special-casing it.
 
 ## Verification
 

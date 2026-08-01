@@ -43,6 +43,7 @@ const args = parseArgs(process.argv.slice(2));
 const PORT = Number(args.port ?? 5199);
 const SEED = args.seed ?? '20250731';
 const QUALITY = args.quality ?? 'ultra';
+const ZONE = args.zone ?? 'forest';
 const WIDTH = Number(args.width ?? 1920);
 const HEIGHT = Number(args.height ?? 1080);
 
@@ -100,6 +101,13 @@ const SHOTS = {
   corridor: async (page) => {
     await page.evaluate(() => {
       const g = window.__game;
+      // Outdoor zones have no corridors -- fall back to a mid-range framing.
+      if (!g.dungeon) {
+        g.rig.distance = 26;
+        g.rig.updateOffset();
+        g.rig.snapTo(g.player.position);
+        return;
+      }
       // Find a floor cell far from any room centre -- that is corridor.
       const d = g.dungeon;
       const T = 2.0;
@@ -210,7 +218,7 @@ async function main() {
     page.on('console', (m) => logs.push(`[${m.type()}] ${m.text()}`));
     page.on('pageerror', (e) => logs.push(`[pageerror] ${e.message}`));
 
-    const url = `http://127.0.0.1:${PORT}/?seed=${SEED}&quality=${QUALITY}`;
+    const url = `http://127.0.0.1:${PORT}/?seed=${SEED}&quality=${QUALITY}&zone=${ZONE}`;
     await page.goto(url, { waitUntil: 'domcontentloaded' });
 
     try {
