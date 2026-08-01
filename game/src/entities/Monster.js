@@ -154,11 +154,23 @@ export class Monster extends Entity {
     this._repathTimer -= dt;
 
     const player = world.player;
-    const dist = player && player.alive ? this.distanceTo(player) : Infinity;
+    const playerUp = !!(player && player.alive);
+    const dist = playerUp ? this.distanceTo(player) : Infinity;
+
+    // Every state past 'idle' assumes a live player to react to. If the
+    // player dies (or is simply absent, e.g. a stray monster in a scene
+    // without one) mid-behaviour, fall back to idle rather than dereferencing
+    // a dead/missing target.
+    if (this.state !== 'idle' && !playerUp) {
+      this.setState('idle');
+      this.clearPath();
+      super.update(dt, world);
+      return;
+    }
 
     switch (this.state) {
       case 'idle':
-        if (dist < this.aggroRange) this.setState('alert');
+        if (playerUp && dist < this.aggroRange) this.setState('alert');
         break;
 
       case 'alert':

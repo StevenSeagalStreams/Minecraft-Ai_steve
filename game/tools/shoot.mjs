@@ -145,6 +145,56 @@ const SHOTS = {
   },
 };
 
+/**
+ * Objective exposure readout for a captured frame.
+ *
+ * Agents were tuning lighting by eyeballing slow screenshots and oscillating
+ * between blown-out and near-black. Numbers converge; vibes do not. We decode
+ * the PNG back inside the page (the WebGL drawing buffer is not readable after
+ * compositing without preserveDrawingBuffer, so round-tripping the screenshot
+ * is the reliable path) and report a luma histogram.
+ *
+ * Read it as: a good moody exterior sits around mean 0.18-0.32 with <2% pure
+ * black and <1% clipped white. `clippedWhite` above ~3% means detail is being
+ * destroyed, not "atmospheric".
+ */
+async function frameStats(page, pngBuffer) {
+  const b64 = pngBuffer.toString('base64');
+  return page.evaluate(async (data) => {
+    const img = new Image();
+    img.src = 'data:image/png;base64,' + data;
+    await img.decode();
+    const W = 320, H = Math.max(1, Math.round((img.height / img.width) * 320));
+    const c = document.createElement('canvas');
+    c.width = W; c.height = H;
+    const ctx = c.getContext('2d', { willReadFrequently: true });
+    ctx.drawImage(img, 0, 0, W, H);
+    const d = ctx.getImageData(0, 0, W, H).data;
+
+    const lumas = [];
+    let black = 0, white = 0, sum = 0;
+    for (let i = 0; i < d.length; i += 4) {
+      // sRGB-weighted luma, good enough for exposure triage
+      const l = (0.2126 * d[i] + 0.7152 * d[i + 1] + 0.0722 * d[i + 2]) / 255;
+      lumas.push(l);
+      sum += l;
+      if (l <= 0.01) black++;
+      if (l >= 0.99) white++;
+    }
+    lumas.sort((a, b) => a - b);
+    const pct = (p) => lumas[Math.min(lumas.length - 1, Math.floor(p * lumas.length))];
+    const n = lumas.length;
+    return {
+      meanLuma: +(sum / n).toFixed(4),
+      p05: +pct(0.05).toFixed(4),
+      p50: +pct(0.50).toFixed(4),
+      p95: +pct(0.95).toFixed(4),
+      crushedBlack: +((black / n) * 100).toFixed(2),
+      clippedWhite: +((white / n) * 100).toFixed(2),
+    };
+  }, b64);
+}
+
 async function settle(page, seconds) {
   // Let the render loop run so animation, flicker and TAA-ish settling land in
   // a representative frame rather than frame zero.
@@ -245,6 +295,7 @@ async function main() {
       await mkdir(dirname(out), { recursive: true });
       const buf = await page.screenshot({ type: 'png' });
       await writeFile(out, buf);
+      const exposure = await frameStats(page, buf);
 
       const stats = await page.evaluate(() => {
         const g = window.__game;
@@ -255,8 +306,13 @@ async function main() {
           entities: g.entities.length,
         };
       });
-      results.push({ name, out, ...stats });
-      console.log(`shot ${name} -> ${out}  fps=${stats.fps} draws=${stats.draws} tris=${stats.tris}`);
+      results.push({ name, out, ...stats, ...exposure });
+      console.log(
+        `shot ${name} -> ${out}\n` +
+        `     draws=${stats.draws} tris=${stats.tris} entities=${stats.entities}\n` +
+        `     luma mean=${exposure.meanLuma} p05=${exposure.p05} p50=${exposure.p50} ` +
+        `p95=${exposure.p95} crushed=${exposure.crushedBlack}% clipped=${exposure.clippedWhite}%`
+      );
     }
 
     const errors = logs.filter((l) => l.startsWith('[error]') || l.startsWith('[pageerror]'));
