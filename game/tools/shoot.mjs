@@ -53,11 +53,26 @@ const HEIGHT = Number(args.height ?? 1080);
  * for putting the world into a specific, repeatable state before the capture.
  */
 const SHOTS = {
-  /** Establishing shot: the player standing in a lit room. */
+  /** Establishing shot, framed on the densest content in the zone. */
   wide: async (page) => {
+    const at = await frameContent(page);
+    if (at) console.log(`     (framed on content cluster at ${at.x},${at.z} -- ${at.clusterSize} instances)`);
     await page.evaluate(() => {
       const g = window.__game;
       g.rig.distance = 38;
+      g.rig.updateOffset();
+      g.rig.snapTo(g.player.position);
+    });
+    await settle(page, 1.6);
+  },
+
+  /** Pulled-back vista: judge zone identity and treeline silhouette mass. */
+  vista: async (page) => {
+    await frameContent(page);
+    await page.evaluate(() => {
+      const g = window.__game;
+      g.rig.distance = 58;
+      g.rig.elevation = 0.52;
       g.rig.updateOffset();
       g.rig.snapTo(g.player.position);
     });
@@ -194,6 +209,78 @@ async function frameStats(page, pngBuffer) {
       clippedWhite: +((white / n) * 100).toFixed(2),
     };
   }, b64);
+}
+
+/**
+ * Move the player to where the zone's content actually is.
+ *
+ * The first critic gate failed partly on the instrument: the `wide` scenario
+ * framed the player spawn, the spawn sat in a rock bowl, and ~386 instanced
+ * trees were nowhere in shot. The critic's words were "if 386 trees exist in
+ * this scene, this establishing shot is aimed at the one place they aren't."
+ *
+ * Rather than hard-code a viewpoint per zone, find the densest cluster of
+ * instanced content in the scene and stand there. Works for any zone without
+ * the zone having to declare anything.
+ */
+async function frameContent(page) {
+  return page.evaluate(() => {
+    const g = window.__game;
+    const pts = [];
+    g.scene.traverse((o) => {
+      if (!o.isInstancedMesh || o.count < 8) return;
+      // Read the instance buffer directly -- getMatrixAt needs a real
+      // Matrix4 and we deliberately have no THREE binding inside the page.
+      // Translation lives at offsets 12 and 14 of each 16-float matrix.
+      const arr = o.instanceMatrix?.array;
+      if (!arr) return;
+      const step = Math.max(1, Math.floor(o.count / 120));
+      for (let i = 0; i < o.count; i += step) {
+        pts.push([arr[i * 16 + 12], arr[i * 16 + 14]]);
+      }
+    });
+    if (pts.length < 12) return null;
+
+    // Densest point by a coarse grid histogram: the cell with the most
+    // samples is where the level's content actually lives.
+    const CELL = 12;
+    const bins = new Map();
+    for (const [x, z] of pts) {
+      const k = `${Math.floor(x / CELL)},${Math.floor(z / CELL)}`;
+      let b = bins.get(k);
+      if (!b) bins.set(k, (b = { n: 0, x: 0, z: 0 }));
+      b.n++; b.x += x; b.z += z;
+    }
+    let best = null;
+    for (const b of bins.values()) if (!best || b.n > best.n) best = b;
+    if (!best) return null;
+
+    const cx = best.x / best.n;
+    const cz = best.z / best.n;
+
+    // Stand on the nearest walkable spot to that cluster, so the camera looks
+    // across the content rather than into it.
+    const col = g.world.colliders;
+    let target = { x: cx, z: cz };
+    if (col) {
+      let found = null;
+      for (let r = 0; r <= 24 && !found; r += 2) {
+        for (let a = 0; a < 12 && !found; a++) {
+          const ang = (a / 12) * Math.PI * 2;
+          const tx = cx + Math.cos(ang) * r;
+          const tz = cz + Math.sin(ang) * r;
+          if (!col.isBlocked(tx, tz, 0.8)) found = { x: tx, z: tz };
+        }
+      }
+      if (found) target = found;
+    }
+
+    const y = g.zone?.terrain?.heightAt ? g.zone.terrain.heightAt(target.x, target.z) : 0;
+    g.player.position.set(target.x, y, target.z);
+    g.player.clearPath();
+    g.rig.snapTo(g.player.position);
+    return { x: +target.x.toFixed(1), z: +target.z.toFixed(1), samples: pts.length, clusterSize: best.n };
+  });
 }
 
 async function settle(page, seconds) {
