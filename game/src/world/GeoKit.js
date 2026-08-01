@@ -34,6 +34,54 @@ export function sphere(r, wSeg, hSeg, cx = 0, cy = 0, cz = 0, squashY = 1) {
   return g;
 }
 
+const _upAxis = new THREE.Vector3(0, 1, 0);
+const _unitScale = new THREE.Vector3(1, 1, 1);
+
+/**
+ * A tapered cylinder spanning two explicit world-space points, built by
+ * aligning a default Y-axis CylinderGeometry with a quaternion rather than
+ * composing Euler rotY/rotZ guesses -- exact for an arbitrary direction, and
+ * it means the "tip" used to chain sub-branches/canopy is the same point the
+ * mesh actually ends at. Shared by trunk/branch/blade builders (Foliage.js,
+ * TreeGen.js) so every stem-like part uses the same math once.
+ */
+export function segment(rTop, rBottom, from, to, radial = 6, openEnded = true) {
+  const dir = new THREE.Vector3().subVectors(to, from);
+  const len = dir.length();
+  if (len < 1e-5) return null;
+  const g = new THREE.CylinderGeometry(rTop, rBottom, len, radial, 1, openEnded);
+  g.translate(0, len / 2, 0);
+  const q = new THREE.Quaternion().setFromUnitVectors(_upAxis, dir.multiplyScalar(1 / len));
+  g.applyMatrix4(new THREE.Matrix4().compose(from, q, _unitScale));
+  return g;
+}
+
+/**
+ * A noise-jittered ellipsoid "blob" -- the building block of a broken-canopy
+ * mass. Each vertex is pushed in/out along its own radial direction *before*
+ * the ellipsoid scale is applied, so the jitter reads as lumpy/torn volume
+ * rather than a stretched sphere with a wobbly equator. Cheap on purpose:
+ * default 7x5 segments is ~120 triangles, enough facets to look organic at
+ * a chunky low-poly budget without threatening the triangle budget when
+ * dozens of these are merged per tree.
+ */
+export function blob(rng, { rx = 1, ry = 1, rz = 1, wSeg = 7, hSeg = 5, cx = 0, cy = 0, cz = 0, jitter = 0.24 } = {}) {
+  const g = new THREE.SphereGeometry(1, wSeg, hSeg);
+  const pos = g.attributes.position;
+  const v = new THREE.Vector3();
+  for (let i = 0; i < pos.count; i++) {
+    v.fromBufferAttribute(pos, i);
+    const j = 1 + (rng ? rng.range(-jitter, jitter) : 0);
+    v.multiplyScalar(j);
+    pos.setXYZ(i, v.x, v.y, v.z);
+  }
+  pos.needsUpdate = true;
+  g.scale(rx, ry, rz);
+  g.translate(cx, cy, cz);
+  g.computeVertexNormals();
+  return g;
+}
+
 /** Merge parts into one non-grouped geometry (single material assumed). */
 export function merge(parts) {
   return mergeGeometries(parts, false);

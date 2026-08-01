@@ -49,12 +49,55 @@ const WIDTH = Number(args.width ?? 1920);
 const HEIGHT = Number(args.height ?? 1080);
 
 /**
+ * Luma bands are per shot type, not global.
+ *
+ * The original 0.18-0.32 band was calibrated on ground-level framings. A vista
+ * where sky fills a third of the frame legitimately reads brighter, and
+ * "correcting" it would mean darkening a scene that is not wrong. An interior
+ * lit only by fire legitimately reads darker. One band for all three would
+ * force two of them into a lie.
+ *
+ * Every scenario declares its type. A capture with no shot-type tag is invalid
+ * and must not be graded -- the harness refuses to emit one.
+ */
+const LUMA_BANDS = {
+  ground:   { min: 0.18, max: 0.32, note: 'ground-level exterior (wide/combat/hero)' },
+  vista:    { min: 0.28, max: 0.45, note: 'pulled-back exterior, sky >= ~35% of frame' },
+  interior: { min: 0.10, max: 0.22, note: 'dungeon/interior, sourced firelight only' },
+};
+
+/**
+ * A "ground exterior" framing inside a dungeon is an interior shot. Resolve
+ * the declared type against the zone rather than making every scenario
+ * declare itself twice.
+ */
+const INTERIOR_ZONES = new Set(['catacombs']);
+function resolveShotType(declared, zone) {
+  if (INTERIOR_ZONES.has(zone) && declared !== 'interior') return 'interior';
+  return declared;
+}
+
+function gradeLuma(shotType, meanLuma) {
+  const band = LUMA_BANDS[shotType];
+  if (!band) return { shotType, valid: false, reason: 'unknown or missing shot type' };
+  const inBand = meanLuma >= band.min && meanLuma <= band.max;
+  return {
+    shotType,
+    valid: true,
+    band: [band.min, band.max],
+    bandNote: band.note,
+    inBand,
+    verdict: inBand ? 'IN BAND' : (meanLuma < band.min ? 'TOO DARK' : 'TOO BRIGHT'),
+  };
+}
+
+/**
  * Scenarios. Each gets the page and the in-page game object and is responsible
  * for putting the world into a specific, repeatable state before the capture.
  */
 const SHOTS = {
   /** Establishing shot, framed on the densest content in the zone. */
-  wide: async (page) => {
+  wide: { type: 'ground', run: async (page) => {
     const at = await frameContent(page);
     if (at) console.log(`     (framed on content cluster at ${at.x},${at.z} -- ${at.clusterSize} instances)`);
     await page.evaluate(() => {
@@ -64,10 +107,10 @@ const SHOTS = {
       g.rig.snapTo(g.player.position);
     });
     await settle(page, 1.6);
-  },
+  } },
 
   /** Pulled-back vista: judge zone identity and treeline silhouette mass. */
-  vista: async (page) => {
+  vista: { type: 'vista', run: async (page) => {
     await frameContent(page);
     await page.evaluate(() => {
       const g = window.__game;
@@ -77,10 +120,10 @@ const SHOTS = {
       g.rig.snapTo(g.player.position);
     });
     await settle(page, 1.6);
-  },
+  } },
 
   /** Close on the character, to judge model and material quality. */
-  hero: async (page) => {
+  hero: { type: 'ground', run: async (page) => {
     await page.evaluate(() => {
       const g = window.__game;
       g.rig.distance = 13;
@@ -89,10 +132,10 @@ const SHOTS = {
       g.rig.snapTo(g.player.position);
     });
     await settle(page, 1.2);
-  },
+  } },
 
   /** Combat: teleport the nearest pack onto the player and let it swing. */
-  combat: async (page) => {
+  combat: { type: 'ground', run: async (page) => {
     await page.evaluate(() => {
       const g = window.__game;
       const p = g.player;
@@ -111,10 +154,10 @@ const SHOTS = {
       g.rig.snapTo(p.position);
     });
     await settle(page, 2.4);
-  },
+  } },
 
   /** A dark corridor, to judge falloff, fog and shadow quality. */
-  corridor: async (page) => {
+  corridor: { type: 'interior', run: async (page) => {
     await page.evaluate(() => {
       const g = window.__game;
       // Outdoor zones have no corridors -- fall back to a mid-range framing.
@@ -145,10 +188,10 @@ const SHOTS = {
       g.rig.updateOffset();
     });
     await settle(page, 1.6);
-  },
+  } },
 
   /** Top-down survey of a whole wing, for layout and silhouette reading. */
-  survey: async (page) => {
+  survey: { type: 'vista', run: async (page) => {
     await page.evaluate(() => {
       const g = window.__game;
       g.rig.distance = 70;
@@ -158,7 +201,7 @@ const SHOTS = {
       g.lighting.setFogDensity(0.006);
     });
     await settle(page, 1.4);
-  },
+  } },
 };
 
 /**
@@ -447,7 +490,7 @@ async function main() {
     await settle(page, 1.5);
 
     for (const name of wanted) {
-      await SHOTS[name](page);
+      await SHOTS[name].run(page);
       const out = args.out && !args.all
         ? args.out
         : join(args.dir ?? 'shots', `${name}.png`);
@@ -455,6 +498,11 @@ async function main() {
       const buf = await page.screenshot({ type: 'png' });
       await writeFile(out, buf);
       const exposure = await frameStats(page, buf);
+      const shotType = resolveShotType(SHOTS[name].type, ZONE);
+      const grade = gradeLuma(shotType, exposure.meanLuma);
+      if (!grade.valid) {
+        throw new Error(`capture "${name}" has no valid shot-type tag -- refusing to emit an ungradable image`);
+      }
 
       const stats = await page.evaluate(() => {
         const g = window.__game;
@@ -465,12 +513,19 @@ async function main() {
           entities: g.entities.length,
         };
       });
-      results.push({ name, out, ...stats, ...exposure });
+      // Sidecar so a critic can verify the shot-type tag and its band verdict
+      // without having to trust stdout.
+      await writeFile(out.replace(/\.png$/, '.json'), JSON.stringify(
+        { shot: name, zone: ZONE, ...grade, ...exposure,
+          draws: stats.draws, tris: stats.tris }, null, 2));
+
+      results.push({ name, out, ...stats, ...exposure, ...grade });
       console.log(
         `shot ${name} -> ${out}\n` +
         `     draws=${stats.draws} tris=${stats.tris} entities=${stats.entities}\n` +
         `     luma mean=${exposure.meanLuma} p05=${exposure.p05} p50=${exposure.p50} ` +
-        `p95=${exposure.p95} crushed=${exposure.crushedBlack}% clipped=${exposure.clippedWhite}%`
+        `p95=${exposure.p95} crushed=${exposure.crushedBlack}% clipped=${exposure.clippedWhite}%\n` +
+        `     [${grade.shotType}] band ${grade.band[0]}-${grade.band[1]}  ${grade.verdict}`
       );
     }
 
