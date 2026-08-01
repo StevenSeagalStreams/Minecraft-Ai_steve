@@ -63,7 +63,7 @@ const browser = await chromium.launch({
 });
 
 try {
-  const page = await browser.newPage({ viewport: { width: 640, height: 360 } });
+  const page = await browser.newPage({ viewport: args.experiment ? { width: 320, height: 180 } : { width: 640, height: 360 } });
   const errs = [];
   page.on('pageerror', (e) => errs.push(e.message));
   page.on('console', (m) => { if (m.type() === 'error') errs.push(m.text()); });
@@ -96,7 +96,7 @@ try {
         // eslint-disable-next-line no-eval
         eval(m);
       }, [mutate]);
-      await page.waitForTimeout(1200);
+      await page.waitForTimeout(700);
       const buf = await page.screenshot({ type: 'png' });
       const b64 = buf.toString('base64');
       const luma = await page.evaluate(async (data) => {
@@ -121,16 +121,10 @@ try {
     await measure('baseline (as shipped)', 'void 0');
     await measure('sun.castShadow = false', `
       g.scene.traverse(o => { if (o.isDirectionalLight && o.intensity > 1) o.castShadow = false; });`);
-    await measure('sun intensity x6', `
-      g.scene.traverse(o => { if (o.isDirectionalLight && o.intensity > 1) o.intensity *= 6; });`);
     await measure('sun OFF (ambient+hemi only)', `
       g.scene.traverse(o => { if (o.isDirectionalLight) o.visible = false; });`);
     await measure('ambient+hemi OFF (sun only)', `
       g.scene.traverse(o => { if (o.isAmbientLight || o.isHemisphereLight) o.visible = false; });`);
-    await measure('grade exposure x4', `
-      if (g.postfx?.grade) g.postfx.grade.uniforms.exposure.value *= 4;`);
-    await measure('ALL shadows off', `
-      g.scene.traverse(o => { if (o.isLight) o.castShadow = false; });`);
     console.log('');
   }
 
