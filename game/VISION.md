@@ -1,0 +1,135 @@
+# EMBERFALL — VISION (CANONICAL, OUTRANKS ALL METRICS)
+
+## The one-sentence game
+
+> A moody isometric ARPG where you carve through monster packs in handcrafted
+> dark-fantasy zones and get rewarded with exciting loot — Diablo II's
+> combat-and-loot loop inside zones with World of Warcraft's instantly
+> recognizable identity.
+
+**If a task does not serve that sentence, it is drift. Stop and re-read this file.**
+
+---
+
+## Part 1 — The Vision Gate (runs BEFORE any metric, in every critic pass)
+
+Four qualitative questions, answered from the screenshot alone, before a single
+number is consulted. **Failing ANY of them fails the pass** regardless of luma,
+draw calls, or triangle counts being in band.
+
+1. **Zone test** — "Name this zone from the shot alone." If the answer is not
+   unmistakably the zone under test, FAIL. A sepia desert is not a forest.
+2. **Franchise test** — "Which game does this frame most resemble?"
+   Acceptable: Diablo II, WoW, "a dark-fantasy ARPG".
+   Unacceptable: "an art experiment", "a tech demo", "shadow puppets", "a desert".
+3. **Play test** — "What would I do in this frame?" A gradable gameplay shot
+   must contain the hero, at least one threat or destination, and at least one
+   reward cue (drop, chest, exit, quest object). Empty vistas are allowed only
+   for shots explicitly declared `vista`.
+4. **Material test** — "Point at three surfaces and describe their material."
+   If any surface can only be described as "flat black" or "flat colour", FAIL.
+   Silhouette-black objects in a lit scene means broken materials, not mood.
+
+---
+
+## Part 2 — Colour script: Blighted Forest (M1)
+
+No zone is built from vibes. Every zone gets its section here **before** work
+begins.
+
+- **Ground** — cold grey-brown earth and mud, patches of dead green-grey grass,
+  worn dirt paths, exposed roots, scattered rocks.
+  **NOT sand. NOT dunes. NOT hardpan tiling.**
+- **Vegetation** — trunks are *lit bark*: deep brown-grey with visible
+  normal-mapped ridges, sun side and shade side clearly different. Canopies are
+  dark desaturated green-to-sickly-olive foliage masses that **receive light**,
+  with sky visible through gaps. Trees must read as objects **in** the light,
+  never as cutouts **in front of** it.
+- **Sky** — cold overcast gradient, pale grey-blue zenith to sickly
+  yellow-green horizon haze. Never beige, never featureless.
+- **Atmosphere** — exponential fog for depth layering: near trees dark and
+  detailed, far trees pale and simple. Aerial perspective is what makes a
+  forest look deep.
+- **Accents** — warm torch/ember orange, used sparingly as the only warm note.
+  That contrast *is* the Diablo mood.
+- **Props (D2 Blood Moor DNA)** — broken fences, a cart, gravestones, corpse
+  piles, crows, a hut ruin, a visible dirt road leading somewhere.
+
+---
+
+## Part 3 — Playability is a pillar, not a later
+
+**Core Loop Invariant.** The game must be playable and fun in a 60-second slice
+at all times:
+
+> spawn → see a destination → fight a pack (readable, punchy, dodgeable) →
+> loot drops with a beam → pick it up → equip something → feel stronger → repeat
+
+- If **any** link is broken, fixing it takes priority over all visual and all
+  instrument work.
+- Every capture set must include one `combat` shot proving the loop: hero
+  mid-fight, enemies reacting, at least one drop on the ground.
+- Every session report opens with
+  `Core loop status: INTACT | BROKEN at <link>`.
+
+---
+
+## Part 4 — Anti-drift process rules
+
+1. **Task ratio** — instrumentation/tooling may never exceed 1 task per 3
+   art-or-gameplay tasks. Four instrument bugs fixed in one session while trees
+   shipped black means the ratio inverted.
+2. **Metrics are floors, not goals** — luma bands, draw budgets and triangle
+   counts are disqualifiers for obviously broken output. Being in band earns
+   nothing. **No task may be phrased as "get metric X into band"**; it must be
+   phrased as a visual or gameplay outcome whose success also lands in band.
+3. **Vision diff ritual** — at the end of every session, place the best current
+   gameplay shot beside Part 2 and answer in writing: *"What is the single
+   biggest gap between this frame and the script?"* That gap is automatically
+   the next session's first art task.
+4. **Scope firewall** — no new systems, zones or features while any Vision Gate
+   question fails on the current zone. Depth before breadth.
+5. **The human is the director** — Borka may override any priority at any gate.
+   When the session report and Borka's play experience disagree, Borka's
+   experience is ground truth.
+
+---
+
+## Vision diff log
+
+Newest first. One entry per session, written against the best gameplay shot.
+
+### 2026-08-02 — sun moved off the camera axis
+
+Best shot: `shots/sunfix/wide.png`. Vision Gate: **1 FAIL, 2 FAIL, 3 FAIL, 4 PASS.**
+
+The black trees are fixed, and the cause was not materials. The camera sits at
+azimuth 45; the sun sat at 232, which is 173 degrees off the view direction --
+almost perfectly behind the subject. Every tree turned its shade side to the
+camera. That is exactly "cutouts in front of the light", and no albedo change
+could have fixed it. Sun moved to azimuth 115, 70 degrees off camera, so every
+trunk and canopy now shows a lit face and a shade face.
+
+Material test now PASSES: the three largest surfaces can be named as cracked
+stone, dry sandy earth, and dark metal. None are flat black.
+
+**Single biggest gap:** the canopies are made of *cracked stone* and the ground
+is *sand*. The frame reads as a boulder field in a desert. Zone identity is
+still the failure, and it is now purely a palette-and-texture problem rather
+than a lighting one.
+
+Next art tasks, in order: canopy foliage material (dark desaturated green to
+sickly olive, receiving light, sky through gaps); ground rebuilt as cold
+grey-brown moor with dead grass; overcast sky gradient; zone props.
+
+### 2026-08-01 — gate 3
+
+Best shot: `shots/gate3/wide.png`. Vision Gate result: **FAIL on 1, 3 and 4.**
+
+**Single biggest gap:** the trees are unlit black cutouts standing in front of
+a sepia frame, so the zone reads as desert badlands rather than forest. The
+frame has no reward cue and no readable material on its largest objects.
+
+Correction backlog, in order: un-black the trees (materials/lighting), rebuild
+the ground as moor rather than dune, sky and fog per the colour script, zone
+props, then core-loop proof.

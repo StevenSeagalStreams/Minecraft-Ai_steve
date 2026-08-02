@@ -108,15 +108,25 @@ export async function createForest(ctx) {
       highlightTint: [1.00, 0.82, 0.52], highlightAmt: 0.16,
       vignette: 0.66,
     },
-    // Measured values, not taste. At 14 degrees the sun grazes flat ground --
-    // NdotL = sin(14) = 0.24 -- which against this terrain's albedo produced a
-    // frame that no exposure setting could rescue. 36 degrees gives NdotL 0.59
-    // and still casts long, characterful shadows.
+    // The sun's azimuth is chosen RELATIVE TO THE CAMERA, which sits at
+    // azimuth 45. At the old 232 the sun was 173 degrees off the view
+    // direction -- almost perfectly behind the subject -- so every tree turned
+    // its shade side to the camera and read as a black cutout standing in
+    // front of the light rather than an object standing in it. No material
+    // change could have fixed that; it was lighting geometry.
+    //
+    // 115 puts the sun 70 degrees off the camera: raking side light, so each
+    // trunk and canopy shows a lit face and a shade face, which is the whole
+    // point of "trees are objects IN the light".
+    //
+    // Elevation stays at 36. At the original 14 the sun grazed flat ground at
+    // NdotL 0.24 and no exposure could rescue it; 36 gives 0.59 and still
+    // throws long, characterful shadows.
     lightRig: {
       sunColor: 0xffb066,
       sunIntensity: 9.5,
       sunElevation: 36,
-      sunAzimuth: 232,
+      sunAzimuth: 115,
       ambientColor: 0x36434c,
       ambientIntensity: 1.0,
       hemiSky: 0x53606b,

@@ -17,6 +17,47 @@ pass work to be polite.
 
 ---
 
+---
+
+## THE VISION GATE — run this FIRST, before any metric
+
+`VISION.md` is canonical and outranks every number in this file. Read it before
+grading. Answer these four questions **from the screenshot alone, before you
+look at a single measurement**. **Failing ANY of them fails the whole pass**,
+regardless of luma, draw calls or triangles being in band.
+
+1. **Zone test** — "Name this zone from the shot alone." If it is not
+   unmistakably the zone under test, FAIL. A sepia desert is not a forest.
+2. **Franchise test** — "Which game does this frame most resemble?"
+   Acceptable: Diablo II, WoW, "a dark-fantasy ARPG".
+   Unacceptable: "an art experiment", "a tech demo", "shadow puppets", "a desert".
+3. **Play test** — "What would I do in this frame?" A gradable gameplay shot
+   needs the hero, at least one threat or destination, and at least one reward
+   cue. Empty frames pass only if the shot is declared `vista`.
+4. **Material test** — "Point at three surfaces and describe their material."
+   If any can only be described as "flat black" or "flat colour", FAIL.
+   Silhouette-black objects in a lit scene are broken materials, not mood.
+
+Report it in this exact form, at the very top of your output:
+
+```
+VISION GATE
+  1 zone test       PASS/FAIL — <the name you actually gave it>
+  2 franchise test  PASS/FAIL — <the game you actually named>
+  3 play test       PASS/FAIL — <what you would do; what reward cue you see>
+  4 material test   PASS/FAIL — <three surfaces, each named as a material>
+  GATE: PASS | FAIL
+```
+
+If the gate fails, still score the pillars below — the scores tell the team
+where the work is — but the pass verdict is FAIL and no amount of in-band
+metrics changes that.
+
+**Metrics are floors, not goals.** Being in band earns nothing; it only means
+the frame is not disqualified. Never praise a frame for hitting a number.
+
+---
+
 ## What you are grading
 
 Only the pixels in the screenshots. Not code, not intentions, not a report.
