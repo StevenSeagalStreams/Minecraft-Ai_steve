@@ -159,6 +159,29 @@ at all times:
 
 ---
 
+## Open findings
+
+### Draw calls: the world is instanced; the characters are not (2026-08-02)
+
+Measured in the catacombs at default framing: **865 draws / 722,391 tris**.
+Attribution from `tools/probe.mjs`:
+
+- `Walls` — 1,114 instances in **1 draw call**
+- `Floor` — 3,049 instances in **1 draw call**
+- everything else — a long tail of ~15 small meshes per character, x56 living
+  monsters, which is roughly **840 of the 865**
+
+So the level is not the cost and never was. Each `CharacterRig` parents ~15
+separate `Mesh` objects to bones, and every one is its own draw call, on every
+monster. The `wide` scenario's 2,325 reading is the same problem with more
+monsters pulled into frame by content-framing.
+
+**Owner: the character pillar**, not the world. The fix is to merge each rig's
+parts into a single geometry (or a skinned mesh), or to instance across
+monsters that share a kind. Until then no amount of world-side instancing moves
+this number, and any budget conversation about zones is measuring the wrong
+thing.
+
 ## Vision diff log
 
 Newest first. One entry per session, written against the best gameplay shot.
