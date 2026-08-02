@@ -67,6 +67,14 @@ export class Entity {
     this.stunTimer = 0;
     this.knockback = new THREE.Vector3();
 
+    // --- status effects (skills pillar reaches these via applySlow/applyDot,
+    // never by poking timers directly) --------------------------------------
+    /** Movement-speed multiplier while `slowTimer > 0` (e.g. Frost Nova). */
+    this.slowTimer = 0;
+    this.slowFactor = 1;
+    /** @type {{tickInterval:number,tickTimer:number,ticksLeft:number,amount:number,source:*}[]} */
+    this.dots = [];
+
     this._desired = new THREE.Vector3();
     this._tmp = new THREE.Vector3();
 
@@ -110,6 +118,31 @@ export class Entity {
     const inv = 1 / Math.max(0.2, this.mass);
     this.knockback.x += dirX * force * inv;
     this.knockback.z += dirZ * force * inv;
+  }
+
+  /**
+   * Slow: a bounded movement-speed multiplier for `duration` seconds. A
+   * second application while one is already active takes the *stronger*
+   * factor (lower number) and the *longer* remaining duration -- refreshing
+   * with a weaker slow must never undo a stronger one already in flight,
+   * same "never cut a stronger effect short" rule HitStop uses.
+   */
+  applySlow(duration, factor) {
+    const f = THREE.MathUtils.clamp(Number.isFinite(factor) ? factor : 1, 0, 1);
+    const d = Math.max(0, Number.isFinite(duration) ? duration : 0);
+    if (d <= 0) return;
+    if (this.slowTimer <= 0 || f < this.slowFactor) this.slowFactor = f;
+    this.slowTimer = Math.max(this.slowTimer, d);
+  }
+
+  /**
+   * Damage-over-time stack (e.g. the builder skill's burn debuff). Capped at
+   * `maxStacks` -- a new stack beyond the cap evicts the oldest rather than
+   * stacking without bound, so a spammed builder cannot produce infinite DPS.
+   */
+  applyDot({ amount, ticks = 3, interval = 0.5, source = null, maxStacks = 3 }) {
+    if (this.dots.length >= maxStacks) this.dots.shift();
+    this.dots.push({ tickInterval: interval, tickTimer: interval, ticksLeft: ticks, amount, source });
   }
 
   /**
@@ -320,6 +353,33 @@ export class Entity {
       return;
     }
 
+    if (this.slowTimer > 0) {
+      this.slowTimer -= dt;
+      if (this.slowTimer <= 0) { this.slowTimer = 0; this.slowFactor = 1; }
+    }
+
+    // Damage-over-time: ticks in real time (not hit-stop scaled -- a status
+    // effect should not get "free" extra time just because a hit landed
+    // elsewhere this frame). Iterated back-to-front so a tick that expires a
+    // stack can splice it out mid-loop safely.
+    if (this.dots.length) {
+      for (let i = this.dots.length - 1; i >= 0; i--) {
+        const d = this.dots[i];
+        d.tickTimer -= dt;
+        if (d.tickTimer <= 0) {
+          d.tickTimer += d.tickInterval;
+          d.ticksLeft -= 1;
+          this.damage(d.amount, d.source, {});
+          if (d.ticksLeft <= 0) this.dots.splice(i, 1);
+        }
+      }
+      // A dot tick can be the killing blow. kill() already zeroed velocity,
+      // cleared the path and started the death pose -- bail out here rather
+      // than running this frame's movement/animator update on a corpse; the
+      // `!this.alive` branch at the top of update() takes over next frame.
+      if (!this.alive) { this.dots.length = 0; return; }
+    }
+
     if (this.stunTimer > 0) {
       this.stunTimer -= dt;
       this._desired.set(0, 0, 0);
@@ -334,7 +394,11 @@ export class Entity {
     const sdt = dt * hitStopScale;
 
     // --- velocity integration ----------------------------------------------
-    const target = this._tmp.copy(this._desired).multiplyScalar(this.moveSpeed);
+    // Slow (e.g. Frost Nova) scales the *target* speed, not acceleration --
+    // a slowed body still turns and starts moving crisply, it just tops out
+    // lower, which reads as "hindered" rather than "sluggish to respond".
+    const effSpeed = this.slowTimer > 0 ? this.moveSpeed * this.slowFactor : this.moveSpeed;
+    const target = this._tmp.copy(this._desired).multiplyScalar(effSpeed);
     const accel = this._desired.lengthSq() > 0.0001 ? this.acceleration : this.friction;
     const dv = target.sub(this.velocity);
     const maxDelta = accel * sdt;

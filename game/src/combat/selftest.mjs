@@ -16,6 +16,11 @@ import { armorReduction, computeDamage, DAMAGE_TUNING } from './Damage.js';
 import { knockbackForce } from './Knockback.js';
 import { HitStop, HITSTOP_MAX_FRAMES } from './HitStop.js';
 import { committedAttackers, canCommitToAttack, propagateAggro } from './AggroPack.js';
+import { AttackState } from './AttackState.js';
+import { Player } from '../entities/Player.js';
+import { Monster } from '../entities/Monster.js';
+import { createSkills } from '../skills/index.js';
+import { SKILLS } from '../skills/SkillDefs.js';
 
 let pass = 0;
 let fail = 0;
@@ -400,6 +405,281 @@ console.log('\n[7] fx:request contract -- combat emits the documented vfx events
   nanDirVictim.damage(10, { critChance: 0 }, {}); // no direction supplied at all
   check('fx:request tolerates a hit with no direction (direction: null, not NaN)',
     seen.every((e) => e.direction === null || (isCleanNumber(e.direction.x) && isCleanNumber(e.direction.z))));
+}
+
+// ---------------------------------------------------------------------------
+console.log('\n[8] AttackState -- input buffering + back-half animation cancel');
+// ---------------------------------------------------------------------------
+{
+  // A minimal duck-typed actor mirroring the shape AttackState expects, in
+  // the same spirit as AggroPack.js's mocks -- exercises the real state
+  // machine, not a reimplementation of it.
+  function mockAnimator() {
+    return {
+      action: null,
+      get busy() { return !!this.action; },
+      play(name, dur, opts) {
+        this.action = { name, t: 0, dur, events: opts.events, fired: new Set(), onEvent: opts.onEvent };
+      },
+      step(dt) {
+        const a = this.action;
+        if (!a) return;
+        a.t += dt;
+        const u = Math.min(1, a.t / a.dur);
+        for (const ev of a.events) {
+          if (u >= ev.at && !a.fired.has(ev)) { a.fired.add(ev); a.onEvent?.(ev.name); }
+        }
+        if (u >= 1) this.action = null;
+      },
+    };
+  }
+  function mockActor() { return { alive: true, stunTimer: 0, animator: mockAnimator() }; }
+
+  // (a) a request while nothing is in flight fires immediately.
+  {
+    const actor = mockActor();
+    const as = new AttackState({ impactAt: 0.4, whooshAt: 0.2 });
+    const fired = as.request(actor, { duration: 0.6, onImpact: () => {} });
+    check('an attack request with no swing in flight fires immediately', fired === true);
+  }
+
+  // (b) a request during the front half (before impact) is buffered, not
+  // dropped and not fired early.
+  {
+    const actor = mockActor();
+    const as = new AttackState({ impactAt: 0.4, whooshAt: 0.2 });
+    let impacts = 0;
+    as.request(actor, { duration: 0.6, onImpact: (n) => { if (n === 'impact') impacts++; } });
+    for (let i = 0; i < 5; i++) actor.animator.step(1 / 60); // well before impact at u=0.4 (~14 frames in)
+    check('front-half swing is not yet cancellable', !as.cancellable);
+    const firedNow = as.request(actor, { duration: 0.6, onImpact: () => {} });
+    check('a click during the front half does not fire this call', firedNow === false);
+    check('a click during the front half is queued, not dropped', as.buffered !== null);
+    check('impact has not fired yet for the first swing', impacts === 0);
+  }
+
+  // (c) the buffered click fires on the FIRST available frame -- the exact
+  // frame the first swing's impact event lands, not one frame later and not
+  // only once the whole animation finishes.
+  {
+    const actor = mockActor();
+    const as = new AttackState({ impactAt: 0.4, whooshAt: 0.2 });
+    let swing1Impacts = 0;
+    let swing2StartFrame = -1;
+    let frame = 0;
+    as.request(actor, { duration: 0.6, onImpact: (n) => { if (n === 'impact') swing1Impacts++; } });
+    let bufferedAt = -1;
+    for (frame = 1; frame <= 40; frame++) {
+      actor.animator.step(1 / 60);
+      if (bufferedAt < 0 && frame === 5) {
+        as.request(actor, {
+          duration: 0.6,
+          onStart: () => { swing2StartFrame = frame; },
+          onImpact: () => {},
+        }); // click mid front-half -- queues, does not fire this call
+        bufferedAt = frame;
+      }
+    }
+    check('swing1 impact fired exactly once', swing1Impacts === 1);
+    // impactAt=0.4 of a 0.6s swing = 0.24s -> frame ceil(0.24*60)=15 is when
+    // `step()` first observes u>=0.4 and fires the event -- swing2 must
+    // start on that exact frame, not frame 16 (one late) and not frame 40
+    // (only once swing1's follow-through finishes on its own).
+    check(`buffered swing2 starts on the very frame swing1 becomes cancellable (frame ${swing2StartFrame}, expected 15)`,
+      swing2StartFrame === 15);
+  }
+
+  // (d) once cancellable, a NEW request fires directly (no buffering needed)
+  // and cancels the recovery tail immediately -- the recovery is cancellable
+  // after the damage event, not before.
+  {
+    const actor = mockActor();
+    const as = new AttackState({ impactAt: 0.4, whooshAt: 0.2 });
+    as.request(actor, { duration: 0.6, onImpact: () => {} });
+    for (let i = 0; i < 40; i++) actor.animator.step(1 / 60); // past impact (u=0.4), still mid-recovery (u<1)
+    check('mid-recovery (past impact) is cancellable', as.cancellable === true);
+    const startedDirectly = as.request(actor, { duration: 0.6, onImpact: () => {} });
+    check('a request during the cancellable back half fires THIS call (no buffering needed)', startedDirectly === true);
+  }
+
+  // (e) stunning the actor clears any pending buffer -- a stagger cancels a
+  // queued follow-up rather than honouring it once the stun wears off.
+  {
+    const actor = mockActor();
+    const as = new AttackState({ impactAt: 0.4, whooshAt: 0.2 });
+    as.request(actor, { duration: 0.6, onImpact: () => {} });
+    for (let i = 0; i < 5; i++) actor.animator.step(1 / 60);
+    as.request(actor, { duration: 0.6, onImpact: () => {} }); // buffered
+    check('buffer is populated before the stun', as.buffered !== null);
+    actor.stunTimer = 0.5;
+    const refused = as.request(actor, { duration: 0.6, onImpact: () => {} });
+    check('a request while stunned is refused outright', refused === false);
+    check('a request while stunned clears any pending buffer', as.buffered === null);
+  }
+
+  // (f) an actor busy with a DIFFERENT action (e.g. a skill cast) is a hard
+  // lock -- a stale `cancellable=true` from an earlier completed swing must
+  // not leak through and let a new swing interrupt it.
+  {
+    const actor = mockActor();
+    const as = new AttackState({ impactAt: 0.4, whooshAt: 0.2 });
+    as.request(actor, { duration: 0.2, onImpact: () => {} });
+    for (let i = 0; i < 20; i++) actor.animator.step(1 / 60); // finishes; cancellable left at true
+    check('AttackState.cancellable is stale-true after a completed swing', as.cancellable === true);
+    actor.animator.play('cast', 0.3, { events: [], onEvent: () => {} }); // something else takes the lock
+    const duringCast = as.request(actor, { duration: 0.6, onImpact: () => {} });
+    check('a swing request is refused while a non-swing action holds the animator lock',
+      duringCast === false);
+    check('it is buffered, not silently dropped, so it still fires once the lock frees', as.buffered !== null);
+  }
+}
+
+// ---------------------------------------------------------------------------
+console.log('\n[9] status effects -- slow scales movement, dots tick and expire');
+// ---------------------------------------------------------------------------
+{
+  // A killing dot tick later in this section deals a huge overkill hit,
+  // which would otherwise trigger HitStop -- and unlike every other test in
+  // this section, nothing here calls resolveOverlaps() to tick it back down
+  // (that is deliberately Entity/Monster/AttackState's own concern, not
+  // status effects'), so isolate this section's timing from any freeze a
+  // previous section left active, and reset again after.
+  HitStop.reset();
+
+  // Slow scales the effective top speed, does not just zero movement.
+  const walker = new Entity({ moveSpeed: 4, acceleration: 1000, friction: 1000, maxHealth: 100 });
+  walker.setPath([{ x: 1000, z: 0 }]);
+  for (let i = 0; i < 30; i++) walker.update(1 / 60, { colliders: null }); // reach full speed unslowed
+  const unslowedX = walker.position.x;
+
+  const slowed = new Entity({ moveSpeed: 4, acceleration: 1000, friction: 1000, maxHealth: 100 });
+  slowed.setPath([{ x: 1000, z: 0 }]);
+  slowed.applySlow(10, 0.5); // 50% slow, long enough to cover the test window
+  for (let i = 0; i < 30; i++) slowed.update(1 / 60, { colliders: null });
+  check('applySlow(duration, 0.5) roughly halves distance covered vs unslowed',
+    Math.abs(slowed.position.x - unslowedX * 0.5) < unslowedX * 0.15);
+
+  const noFactor = new Entity({ maxHealth: 100 });
+  noFactor.applySlow(1, 2); // garbage factor > 1 must clamp, never speed the target up
+  check('applySlow clamps an out-of-range factor into [0,1]', noFactor.slowFactor <= 1);
+
+  // A stronger/longer slow must not be shortened by a weaker one arriving
+  // later -- same "never cut a stronger effect short" rule as HitStop.
+  const kited = new Entity({ maxHealth: 100 });
+  kited.applySlow(5, 0.3);
+  kited.applySlow(1, 0.8); // weaker, shorter -- must not overwrite
+  check('a weaker/shorter slow does not overwrite a stronger one already active',
+    kited.slowFactor === 0.3 && kited.slowTimer === 5);
+
+  // Slow expires on its own.
+  const expiring = new Entity({ maxHealth: 100 });
+  expiring.applySlow(0.05, 0.4);
+  for (let i = 0; i < 10; i++) expiring.update(1 / 60, { colliders: null }); // 0.166s > 0.05s duration
+  check('slow expires back to factor 1 once its duration elapses',
+    expiring.slowTimer === 0 && expiring.slowFactor === 1);
+
+  // Dots: tick for damage, respect stack cap, and expire after their ticks.
+  const burning = new Entity({ maxHealth: 1000, armor: 0 });
+  burning.applyDot({ amount: 5, ticks: 3, interval: 0.1, maxStacks: 3 });
+  const hpBefore = burning.health;
+  for (let i = 0; i < 40; i++) burning.update(1 / 60, { colliders: null }); // 0.667s > 3*0.1s
+  check('a dot deals its ticks worth of damage over time (3 ticks x 5dmg = 15)',
+    Math.abs((hpBefore - burning.health) - 15) < 0.01);
+  check('a fully-ticked dot removes itself', burning.dots.length === 0);
+
+  const stacked = new Entity({ maxHealth: 1000, armor: 0 });
+  for (let i = 0; i < 5; i++) stacked.applyDot({ amount: 1, ticks: 10, interval: 5, maxStacks: 3 });
+  check('applyDot never exceeds maxStacks (evicts oldest instead of growing unbounded)',
+    stacked.dots.length === 3);
+
+  // A dot tick that lands the killing blow must not leave the entity running
+  // this frame's movement/animator update as if still alive (regression
+  // guard for the mid-update early-return added alongside dot processing).
+  const dyingToDot = new Entity({ maxHealth: 4, armor: 0 });
+  dyingToDot.applyDot({ amount: 999, ticks: 1, interval: 0.0001 });
+  dyingToDot.update(1 / 60, { colliders: null });
+  check('a killing dot tick actually kills (alive=false) within update()', dyingToDot.alive === false);
+
+  // That killing blow was a heavy overkill hit and would have triggered
+  // HitStop -- nothing in this section calls resolveOverlaps() to tick it
+  // back down (deliberately: that is not what status effects own), so reset
+  // it explicitly rather than leaking a stuck freeze into section [10].
+  HitStop.reset();
+}
+
+// ---------------------------------------------------------------------------
+console.log('\n[10] Player integration -- real class, not a mock (buffering, D1 no-regen, skills)');
+// ---------------------------------------------------------------------------
+{
+  // Player.js pulls in the full procedural rig (Models.js/CharacterRig.js),
+  // which -- unlike a browser canvas texture -- has no DOM dependency, so the
+  // *real* Player/Monster classes construct and run under plain node. Using
+  // them here (rather than bare Entity mocks) proves the actual production
+  // wiring: AttackState behind Player.attack()/canAttack(), the D1 combat
+  // clock, and the skills subsystem's mana/cooldown/lock gates.
+  const DT = 1 / 60;
+  HitStop.reset();
+
+  const p = new Player();
+  check('a real Player constructs headlessly (no canvas/DOM needed)', p.type === 'player' && !!p.animator);
+
+  // Buffering through the real Player API (not the raw AttackState mock).
+  // No combat damage happens in this sub-test (no target), so HitStop cannot
+  // be triggered/left stuck here -- dt passes through at full scale.
+  let impacts = 0;
+  p.attack((name) => { if (name === 'impact') impacts++; });
+  for (let i = 0; i < 10; i++) p.update(DT, { colliders: null });
+  const bufferedNow = p.attack((name) => { if (name === 'impact') impacts++; }); // mid front-half of swing1
+  check('Player.attack() buffers (does not fire) a click mid front-half', bufferedNow === false);
+  for (let i = 0; i < 30; i++) p.update(DT, { colliders: null });
+  check('the buffered click fired via the real Player/AttackState wiring (2 impacts total)', impacts === 2);
+
+  // D1 rule: no health regen in combat, through the real Player class.
+  const p2 = new Player();
+  p2.health = 50;
+  p2.damage(1, { critChance: 0 }, {}); // any hit marks combat active
+  for (let i = 0; i < 120; i++) p2.update(DT, { colliders: null }); // 2s, well under COMBAT_LOCKOUT
+  check('Player.health does not regenerate for 2s immediately after taking a hit',
+    p2.health <= 50 - 1 + 0.01);
+
+  const p3 = new Player();
+  p3.health = 50;
+  for (let i = 0; i < 120; i++) p3.update(DT, { colliders: null }); // never hit, never targeted -> out of combat
+  check('Player.health DOES regenerate when never in combat', p3.health > 50);
+
+  // Skills: mana/cooldown/animation-lock gating, and canCast() denies what it should.
+  const p4 = new Player();
+  const m = new Monster({ kind: 'skeleton' });
+  m.position.set(1, 0, 0);
+  p4.position.set(0, 0, 0);
+  const world4 = { player: p4, monsters: [m], bus: { emit() {} } };
+  const input4 = { _p: new Set(), pressed(c) { return this._p.has(c); } };
+  const skills4 = createSkills({ bus: world4.bus, input: input4, world: world4, rng: { range: (a, b) => (a + b) / 2 } });
+
+  check('canCast is true when off cooldown, affordable, and idle', skills4.canCast('firebolt'));
+  const manaBefore = p4.mana;
+  const castOk = skills4.cast('firebolt');
+  check('cast() fires and deducts mana', castOk === true && p4.mana === manaBefore - SKILLS.firebolt.manaCost);
+  check('cast() locks the animator (busy) for its lockDuration', p4.animator.busy === true);
+  check('canCast refuses the SAME skill again immediately (cooldown)', skills4.canCast('firebolt') === false);
+
+  const meleeWhileCasting = p4.attack(() => {});
+  check('a melee swing cannot fire while a skill cast holds the animation lock',
+    meleeWhileCasting === false && p4.animator.busy === true);
+
+  // The cast's damage is heavy enough to trigger HitStop -- tick
+  // resolveOverlaps() every frame, exactly as main.js's real phase order
+  // does (entities update, THEN overlap resolution burns one hit-stop
+  // frame), so the freeze releases on schedule instead of stalling dt.
+  for (let i = 0; i < 60; i++) {
+    skills4.update(DT);
+    p4.update(DT, { colliders: null });
+    m.update(DT, { colliders: null, monsters: [m], player: p4 });
+    resolveOverlaps([p4, m], 1);
+  }
+  check('the lock releases once lockDuration elapses', p4.animator.busy === false);
+  check('the skeleton took damage from the resolved cast', m.health < m.maxHealth);
+  HitStop.reset();
 }
 
 // ---------------------------------------------------------------------------

@@ -330,20 +330,46 @@ class Game {
       this.player.attack((ev) => {
         if (ev !== 'impact') return;
         if (!t.alive || this.player.distanceTo(t) > this.player.attackRange * 1.35) return;
-        const dir = new THREE.Vector3(
-          t.position.x - this.player.position.x, 0, t.position.z - this.player.position.z
-        ).normalize();
-        const dmg = 18 + this.rng.range(-4, 6);
-        t.damage(dmg, this.player, { direction: dir, stagger: 0.7 });
-        t.applyKnockback(dir.x, dir.z, 2.2);
-        this.rig.addTrauma(0.16);
-        this.bus.emit('combat:hit', { attacker: this.player, victim: t, amount: dmg, direction: dir });
+        _v1.set(t.position.x - this.player.position.x, 0, t.position.z - this.player.position.z).normalize();
+
+        // Everything about resolving a hit -- armour, crit, mass-scaled
+        // knockback, hit-stop, camera shake, the combat:hit event -- lives in
+        // Entity.damage(). This call site used to re-derive all of it, which
+        // meant three bugs at once: melee rolled a hardcoded 18 +/- and so
+        // never saw equipment (breaking "equip something -> feel stronger"),
+        // combat:hit was emitted twice per swing (double-counting telemetry
+        // and firing the fx layer twice), and knockback was applied on top of
+        // the knockback damage() had already applied. Pass the raw weapon
+        // amount and let the one funnel do its job.
+        const dealt = t.damage(this._playerWeaponDamage(), this.player, {
+          direction: _v1,
+          stagger: 0.7,
+        });
+
         if (!t.alive) {
           this.player.experience += t.experienceValue;
-          this.bus.emit('entity:died', { entity: t });
+          // Entity does not announce its own death -- the loop owns reaping and
+          // rewards, so it owns the event that items/telemetry key off.
+          this.bus.emit('entity:died', { entity: t, killer: this.player });
         }
+        return dealt;
       });
     }
+  }
+
+  /**
+   * Raw melee damage before the victim's mitigation. Reads aggregated
+   * equipment from the items pillar when it exists so that equipping a better
+   * weapon actually raises the number -- that is the "feel stronger" link of
+   * the core loop, and it is only real if it is read here.
+   */
+  _playerWeaponDamage() {
+    const stats = this.items?.stats;
+    const min = Number.isFinite(stats?.damageMin) ? stats.damageMin : 14;
+    const max = Number.isFinite(stats?.damageMax) ? stats.damageMax : 24;
+    const lo = Math.min(min, max);
+    const hi = Math.max(min, max);
+    return lo + this.rng.next() * (hi - lo);
   }
 
   _pickEntity() {

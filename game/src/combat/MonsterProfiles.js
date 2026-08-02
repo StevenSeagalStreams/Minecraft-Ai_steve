@@ -33,14 +33,30 @@ export const MONSTER_PROFILES = {
     kind: 'skeleton',
     radius: 0.40, height: 1.78, mass: 1.15,
     moveSpeed: 3.0, acceleration: 20, friction: 20,
-    maxHealth: 52, armor: 6,
+    // Gate 1 tuning pass: at the player's ~16.8 avg mitigated melee damage
+    // (18avg base vs armor 6), 46 hp lands squarely in the mandated
+    // "trash TTK 1-3 hits early game" (52/16.8=3.1 hits was a shade over).
+    maxHealth: 46, armor: 6,
     aggroRange: 13, leashRange: 32, alertRadius: 9,
     attackRange: 2.0, attackDamage: 15, attackVariance: 0.18,
     attackDuration: 1.05, windupEventAt: 0.58, whooshEventAt: 0.34,
-    attackInterval: 1.7, stagger: 0.72,
+    // 1.7 -> 1.5: a lone skeleton was too gentle (7.9 dps) to read as a real
+    // threat; catacombs.js spawns 1-4 per room, so most fights are packs, not
+    // solos -- this raises per-attacker dps just enough that 2-3 committed
+    // attackers (see packMaxAttackers below) is genuinely lethal to a
+    // careless player, not just a health-bar tax.
+    attackInterval: 1.5, stagger: 0.72,
     critChance: 0.07, critMultiplier: 1.8,
     experienceValue: 16,
-    packMaxAttackers: 2, circleRadiusMul: 1.0, repositionTime: 0.6,
+    // 2 -> 3: catacombs.js spawns up to 4 skeletons per room; letting 3
+    // commit at once (instead of 2) is what makes a full room feel like it is
+    // surrounding you rather than taking polite turns -- the pull system
+    // mandate ("packs you plan around") needs the pack to actually hit like
+    // one. Combined with the interval change above: 3 concurrent attackers
+    // vs the player's 220 hp / 5 armor is a ~8s time-to-kill if you stand and
+    // facetank a full room, survivable if you pull fewer, retreat into a
+    // corridor to cap how many can reach you, or use Frost Nova.
+    packMaxAttackers: 3, circleRadiusMul: 1.0, repositionTime: 0.6,
     erratic: 0.12,
     strideLength: 1.0, bounce: 1.1, weight: 1.3, idleSway: 0.5,
   },

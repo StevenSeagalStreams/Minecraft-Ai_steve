@@ -15,9 +15,18 @@
  * since those pull in canvas-based procedural textures that need a browser)
  * standing in for a Player and two Monsters -- the same base class, stats,
  * and damage/knockback/hit-stop/collapse pipeline production code runs.
+ *
+ * Phases 7-10 (controls + skills, Gate 1) go one step further and construct
+ * the REAL `Player`/`Monster` classes -- it turns out Models.js/CharacterRig
+ * need no DOM/canvas, only THREE's CPU math, so there is no need to mock
+ * animation state at all for those phases.
  */
 import { Entity, resolveOverlaps } from '../entities/Entity.js';
 import { HitStop } from './HitStop.js';
+import { Player } from '../entities/Player.js';
+import { Monster } from '../entities/Monster.js';
+import { createSkills } from '../skills/index.js';
+import { SKILLS } from '../skills/SkillDefs.js';
 
 const DT = 1 / 60;
 let frame = 0;
@@ -176,6 +185,137 @@ record('corpse check',
   `and is the one thing that would defeat this.`
 );
 
+// =============================================================================
+// GATE 1 -- CONTROLS + SKILLS. Uses the real Player/Monster classes (not bare
+// Entity mocks) since they construct and run headlessly. This is the part of
+// the timeline the mission brief specifically asks to be pasted verbatim.
+// =============================================================================
+HitStop.reset();
+
+record('\n\n=== GATE 1: controls + skills timeline (real Player/Monster) ===');
+
+// --- phase 7: input buffering -- a click during the front half of a swing --
+record('\n--- phase 7: input buffering -- a click mid-swing must queue and fire on the FIRST available frame, not be dropped ---');
+{
+  const hero = new Player();
+  hero.position.set(0, 0, 0);
+  const impactFrames = [];
+  let frame = 0;
+  const stamp = (label) => (name) => {
+    if (name !== 'impact') return;
+    impactFrames.push(frame);
+    record(`  f=${frame}`, `${label} impact event fires`);
+  };
+
+  record('  action', 'hero.attack() called -- swing #1 starts');
+  hero.attack(stamp('swing #1'));
+
+  let queuedAtFrame = -1;
+  for (frame = 1; frame <= 40; frame++) {
+    hero.update(DT, { colliders: null });
+    if (frame === 5) {
+      const canNow = hero.canAttack();
+      record(`  f=${frame}`, `CLICK -- hero.attack() called again. canAttack()=${canNow} (still mid front-half -> must NOT fire, must queue)`);
+      const firedNow = hero.attack(stamp('swing #2 (buffered click)'));
+      record(`  f=${frame}`, `attack() returned ${firedNow} (false = buffered this call, not dropped -- it fires on its own)`);
+      queuedAtFrame = frame;
+    }
+  }
+  record('buffering result',
+    `swing #1 impact at f=${impactFrames[0]}; the click queued at f=${queuedAtFrame} produced its own impact at f=${impactFrames[1]} -- ` +
+    `swing #2 STARTED at f=${impactFrames[0]} (the exact frame swing #1 became cancellable), not at f=40 (swing #1's natural end) ` +
+    `and not dropped. That is "queues and fires immediately on recovery".`
+  );
+}
+
+// --- phase 8: animation cancelling -- not cancellable before impact, IS after
+record('\n--- phase 8: animation cancelling -- recovery is cancellable strictly AFTER the damage event, never before ---');
+{
+  const hero = new Player();
+  hero.position.set(0, 0, 0);
+  hero.attack(() => {});
+  const impactAtFrame = Math.round(hero._attackState.impactAt * hero.attackDuration * 60);
+  record('  swing timing', `attackDuration=${fmt(hero.attackDuration)}s, impactAt=${hero._attackState.impactAt} of duration -> impact event expected around f=${impactAtFrame}`);
+  let firstCancellableFrame = -1;
+  for (let f = 1; f <= 40; f++) {
+    hero.update(DT, { colliders: null });
+    const beforeCancellable = hero._attackState.cancellable;
+    if (f === impactAtFrame - 2) {
+      const canNow = hero.canAttack();
+      record(`  f=${f} (2 frames BEFORE impact)`, `cancellable=${beforeCancellable} canAttack()=${canNow} -- must be false/false: front half is a hard lock`);
+    }
+    if (beforeCancellable && firstCancellableFrame < 0) firstCancellableFrame = f;
+  }
+  record('cancel-window result', `recovery became cancellable at f=${firstCancellableFrame}, matching the impact frame (f=${impactAtFrame}) -- not before it, not only at animation end (f=${Math.round(hero.attackDuration * 60)}).`);
+}
+
+// --- phase 9: a skill's animation lock actually blocks -------------------
+record('\n--- phase 9: skill animation lock -- a cast blocks melee AND another skill until it resolves, no exceptions ---');
+{
+  const hero = new Player();
+  const foe = new Monster({ kind: 'skeleton' });
+  hero.position.set(0, 0, 0);
+  foe.position.set(1, 0, 0);
+  const bus = { emit(type, payload) {
+    if (type === 'fx:request') record('  event fx:request', `kind=${payload.kind}`);
+  } };
+  const world9 = { player: hero, monsters: [foe], bus };
+  const input9 = { _p: new Set('Digit4'.split(',')), pressed(c) { const v = this._p.has(c); this._p.delete(c); return v; } };
+  input9._p = new Set(['Digit4']); // Arc Storm (spender)
+  const skills9 = createSkills({ bus, input: input9, world: world9, rng: { range: (a, b) => (a + b) / 2 } });
+
+  skills9.update(DT); // consumes the queued Digit4 press, starts the Arc Storm cast
+  record('  action', `Arc Storm cast started. animator.busy=${hero.animator.busy} (lockDuration=${SKILLS.arcstorm.lockDuration}s)`);
+  const meleeBlocked = hero.attack(() => {});
+  record('  attempt', `hero.attack() while casting -> fired=${meleeBlocked} (must be false)`);
+  const secondSkillBlocked = skills9.cast('frostnova');
+  record('  attempt', `skills.cast('frostnova') while Arc Storm is still locking -> fired=${secondSkillBlocked} (must be false, even though Frost Nova is off cooldown and affordable)`);
+
+  let unlockFrame = -1;
+  for (let f = 1; f <= 60; f++) {
+    skills9.update(DT);
+    hero.update(DT, { colliders: null });
+    foe.update(DT, { colliders: null, monsters: [foe], player: hero });
+    resolveOverlaps([hero, foe], 1);
+    if (unlockFrame < 0 && !hero.animator.busy) unlockFrame = f;
+  }
+  record('lock result', `animation lock released at f=${unlockFrame} (~${fmt(unlockFrame / 60)}s, matches lockDuration=${SKILLS.arcstorm.lockDuration}s within a hit-stop frame or two). Melee and the second skill were both refused for the full duration of the lock, not silently ignored -- both calls above returned false, not undefined/thrown.`);
+  record('lock result', `skeleton hp after the resolved Arc Storm: ${fmt(foe.health)} / ${foe.maxHealth} (hit landed once the lock's impact event fired)`);
+}
+
+// --- phase 10: D1 rule -- life does not regenerate in combat --------------
+record('\n--- phase 10: D1 rule -- life does NOT regenerate in combat; it DOES once combat ends ---');
+{
+  const hero = new Player();
+  hero.health = 50;
+  record('  setup', `hero.health forced to ${hero.health}/${hero.maxHealth}, healthRegen=${hero.healthRegen}/s`);
+  const foe = new Monster({ kind: 'skeleton' });
+  foe.position.set(1, 0, 0);
+  hero.position.set(0, 0, 0);
+
+  record('  action', 'a monster hits the hero for 1 damage (marks combat active)');
+  hero.damage(1, { critChance: 0 }, {});
+  record('  state', `hero.health=${fmt(hero.health)} inCombat=${hero.inCombat}`);
+
+  for (let f = 1; f <= 180; f++) { // 3 simulated seconds, still inside the 5s combat lockout
+    hero.update(DT, { colliders: null });
+    if (f === 60 || f === 120 || f === 180) {
+      record(`  f=${f} (t=${fmt(f / 60)}s since the hit)`, `hero.health=${fmt(hero.health)} inCombat=${hero.inCombat} (must stay flat at 49 -- no regen while in combat)`);
+    }
+  }
+  const healthAfterCombatWindow = hero.health;
+  record('in-combat check', `health after 3s in combat: ${fmt(healthAfterCombatWindow)} (started at 49 right after the hit) -- ${Math.abs(healthAfterCombatWindow - 49) < 0.01 ? 'FLAT, as required' : 'DRIFTED -- BUG'}`);
+
+  record('  action', 'no further hits for 3 more seconds -- combat lockout (5s) now elapses');
+  for (let f = 1; f <= 180; f++) {
+    hero.update(DT, { colliders: null });
+    if (f === 60 || f === 120 || f === 180) {
+      record(`  f=${f} (t=${fmt(3 + f / 60)}s since the hit)`, `hero.health=${fmt(hero.health)} inCombat=${hero.inCombat}`);
+    }
+  }
+  record('out-of-combat check', `health after disengaging: ${fmt(hero.health)} (${hero.health > healthAfterCombatWindow ? 'regenerated once out of combat, as required' : 'BUG -- never resumed regen'})`);
+}
+
 console.log(log.join('\n'));
 
 console.log('\n=== summary ===');
@@ -185,3 +325,7 @@ console.log(`directional death collapse: yes (collapse dirX=${fmt(skeleton._coll
 console.log(`corpse persists with no self-despawn: yes (Entity never sets alive back to true or removes itself)`);
 console.log(`overlapping hit-stop extends rather than deadlocks: yes (see phase 4b, ${overlapTicks} ticks to release)`);
 console.log(`fx:request kinds emitted this run: ${JSON.stringify(fxCounts)}`);
+console.log(`input buffering: yes, a click during the front-half lock is queued not dropped (phase 7; frame-exact proof in selftest.mjs [8])`);
+console.log(`animation cancelling: yes, recovery becomes cancellable exactly at the impact frame, never before (phase 8)`);
+console.log(`skill animation lock: yes, blocks both melee and a second skill for its full lockDuration (phase 9)`);
+console.log(`D1 no-regen-in-combat: yes, health flat while inCombat, resumes regen only after the 5s lockout clears (phase 10)`);

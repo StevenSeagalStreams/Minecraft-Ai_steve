@@ -1,6 +1,13 @@
 import * as THREE from 'three';
 import { Entity } from './Entity.js';
 import { buildWarrior, buildSword } from './Models.js';
+import { AttackState } from '../combat/AttackState.js';
+
+/** Seconds since the last combat action before life regen resumes -- the D1
+ *  rule ("life does not regenerate in combat") needs a definition of
+ *  "in combat" narrower than "has ever been hit". A retreat that survives
+ *  this long has genuinely disengaged. */
+const COMBAT_LOCKOUT = 5.0;
 
 /**
  * The player character.
@@ -10,6 +17,11 @@ import { buildWarrior, buildSword } from './Models.js';
  * (shift) attacks in place. The critical detail is the *attack lunge*: when
  * the target is just out of reach, the character steps in rather than
  * refusing to swing, which is what makes melee feel responsive.
+ *
+ * Attack timing (input buffering + animation cancelling) is delegated to
+ * `AttackState` (src/combat/AttackState.js) rather than reimplemented here --
+ * see that file for the actual front-half-locked / back-half-cancellable /
+ * single-slot-buffer mechanics.
  */
 export class Player extends Entity {
   constructor(opts = {}) {
@@ -42,12 +54,17 @@ export class Player extends Entity {
 
     this.attackRange = opts.attackRange ?? 2.25;
     this.attackDuration = opts.attackDuration ?? 0.62;
-    this.attackCooldown = 0;
+    // impactAt=0.42 matches the swing's own damage-event timing (see
+    // attack() below) -- that is the frame the back half becomes cancellable.
+    this._attackState = new AttackState({ impactAt: 0.42, whooshAt: 0.30 });
 
     this.maxMana = opts.maxMana ?? 90;
     this.mana = this.maxMana;
     this.manaRegen = 3.2;
+    // D1 rule: life does NOT regenerate in combat -- potions and leech only.
+    // See `inCombat` / COMBAT_LOCKOUT below for what "in combat" means here.
     this.healthRegen = 0.6;
+    this._combatTimer = COMBAT_LOCKOUT + 1; // start fully "out of combat"
 
     this.level = 1;
     this.experience = 0;
@@ -57,6 +74,17 @@ export class Player extends Entity {
     this.moveOrder = null;
 
     this._tmpDir = new THREE.Vector3();
+  }
+
+  /** True while a fight is live enough that health regen must stay off. */
+  get inCombat() {
+    return this._combatTimer < COMBAT_LOCKOUT || !!(this.target && this.target.alive);
+  }
+
+  /** Any hit landing on the player restarts the no-regen clock. */
+  damage(amount, source = null, opts = {}) {
+    this._combatTimer = 0;
+    return super.damage(amount, source, opts);
   }
 
   /** Issue a move order to a world position. */
@@ -79,8 +107,16 @@ export class Player extends Entity {
     }
   }
 
+  /**
+   * Can a *new* swing start (or cancel into) right now? True either with no
+   * swing in flight, or once the in-flight swing has passed its damage event
+   * -- see AttackState. This is deliberately looser than "!animator.busy":
+   * that would keep gating input on the full follow-through animation
+   * finishing, which is exactly the dead-frame bug the back-half cancel
+   * window exists to fix.
+   */
   canAttack() {
-    return this.alive && this.attackCooldown <= 0 && !this.animator.busy && this.stunTimer <= 0;
+    return this._attackState.canAct(this);
   }
 
   /**
@@ -104,24 +140,40 @@ export class Player extends Entity {
     this.knockback.z += (dz / len) * lunge * 9;
   }
 
-  /** @param onImpact called at the frame the blade should connect */
+  /**
+   * @param onImpact called at the frame the blade should connect ('impact')
+   *   and at the telegraph frame ('whoosh').
+   * @returns true if a swing started THIS call, false if it was buffered (or
+   *   refused outright -- dead/stunned). A buffered request is not lost: it
+   *   fires on its own the instant the in-flight swing's damage event lands,
+   *   see AttackState._fireEvent -- the caller does not need to retry it.
+   */
   attack(onImpact) {
-    if (!this.canAttack()) return false;
-    this.attackCooldown = this.attackDuration * 0.92;
-    this._lungeToward(this.target);
-    this.animator.play('attackSwing', this.attackDuration, {
-      events: [{ at: 0.42, name: 'impact' }, { at: 0.30, name: 'whoosh' }],
-      onEvent: (name) => onImpact?.(name),
+    return this._attackState.request(this, {
+      name: 'attackSwing',
+      duration: this.attackDuration,
+      onStart: () => { this._combatTimer = 0; this._lungeToward(this.target); },
+      onImpact,
     });
-    return true;
   }
 
   update(dt, world) {
-    if (this.attackCooldown > 0) this.attackCooldown -= dt;
+    // A stagger should cancel a queued follow-up swing, not politely honour
+    // it once the stun wears off -- see AttackState.request's own guard too,
+    // this covers the case where the stun lands *between* attack() calls.
+    if (this.stunTimer > 0) this._attackState.clearBuffer();
+    // Flush a buffered swing the instant the animator frees up, even when it
+    // was freed by something other than a swing finishing (a skill cast has
+    // no impact-event hook back into AttackState) -- see tick()'s own note.
+    else this._attackState.tick(this);
 
+    this._combatTimer += dt;
     if (this.alive) {
       this.mana = Math.min(this.maxMana, this.mana + this.manaRegen * dt);
-      this.health = Math.min(this.maxHealth, this.health + this.healthRegen * dt);
+      // D1 rule: no health regen while in combat -- potions/leech only.
+      if (!this.inCombat) {
+        this.health = Math.min(this.maxHealth, this.health + this.healthRegen * dt);
+      }
     }
 
     // Re-path toward a moving target, but only when it has drifted far enough

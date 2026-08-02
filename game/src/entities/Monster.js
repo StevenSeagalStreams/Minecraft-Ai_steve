@@ -226,7 +226,11 @@ export class Monster extends Entity {
         this.clearPath();
         this.faceTowards(player.position.x, player.position.z);
         if (dist > this.attackRange * 1.25) { this.setState('chase'); break; }
-        if (this.attackCooldown <= 0 && !this.animator.busy) {
+        // stunTimer gate: a stunned monster must not be able to *start* a new
+        // swing just because its cooldown happened to expire mid-stun -- the
+        // player's stun (Frost Nova) needs to actually stop attacks, not just
+        // footwork, or "barely recoverable by skill" is a lie.
+        if (this.attackCooldown <= 0 && this.stunTimer <= 0 && !this.animator.busy) {
           this.attackCooldown = this.attackInterval;
           const p = this.profile;
           // The wind-up must be visible: skeletons get a long, deliberate
