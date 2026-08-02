@@ -43,7 +43,7 @@ function resolveChromium() {
 
 const args = parseArgs(process.argv.slice(2));
 const PORT = Number(args.port ?? 5260);
-const ZONE = args.zone ?? 'forest';
+const ZONE = args.zone ?? 'catacombs';
 const SEED = args.seed ?? '20250731';
 
 const server = spawn('npx',

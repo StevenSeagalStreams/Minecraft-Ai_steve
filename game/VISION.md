@@ -1,13 +1,69 @@
 # EMBERFALL — VISION (CANONICAL, OUTRANKS ALL METRICS)
 
-## The one-sentence game
+> **GAME DIRECTION MANDATE — supersedes the colour script below where they
+> conflict. Systems outrank screenshots. "Done" means: a player can play it, it
+> can kill them, and it can reward them. Screenshots are evidence, not product.**
 
-> A moody isometric ARPG where you carve through monster packs in handcrafted
-> dark-fantasy zones and get rewarded with exciting loot — Diablo II's
-> combat-and-loot loop inside zones with World of Warcraft's instantly
-> recognizable identity.
+## Part 0 — Identity
 
-**If a task does not serve that sentence, it is drift. Stop and re-read this file.**
+- **Graphics: Diablo 1.** Oppressive, claustrophobic, torchlit. Darkness is a
+  *gameplay resource* — light pools around torches and the hero, corridors fade
+  to genuine black, you hear things before you see them. Palette: stone greys,
+  dried-blood reds, candle golds, sickly greens. Cathedral → catacombs → caves
+  → hell as the tonal ladder. **Interiors dominate; the surface zone exists to
+  funnel you underground.**
+- **Feel: WoW dungeons and raids.** Deliberate, punishing, pull-based. Enemies
+  are not popcorn — they are packs you plan around. One careless step
+  chain-pulls the room and you die. Bosses are mechanics checks, not stat
+  checks.
+- D1's dread, WoW's discipline. That pairing *is* the product.
+
+## Order of operations (non-negotiable)
+
+Each gate STOPS for Borka. Art continues in parallel but may never block or
+outrank a systems gate.
+
+1. **Combat feel lock** — player controls + 3 skills + one pack fighting back,
+   tuned until movement and hit feel are right.
+   *Gate: Borka plays and approves feel before anything below is built.*
+2. **Pull system** — pack / social aggro / patrols / runners in a graybox wing.
+   *Acceptance test, verbatim: Borka must wipe at least once to a chain pull he
+   recognises as his own fault, and clear it on a later attempt through learned
+   play.*
+3. **Itemization + drop engine + harness validation** → drop-feel gate.
+4. **First full dungeon + boss** → dungeon-balance gate.
+5. **Crafting / economy** → economy gate.
+6. Only then: second dungeon, more skills, breadth.
+
+> A graybox dungeon with perfect pull tension is a better game than a beautiful
+> forest with nothing in it.
+
+## Player (D1 DNA)
+
+Strength / Dexterity / Vitality / Energy, allocated on level-up, with real gear
+requirements that gate equipping. **Life does not regenerate in combat** —
+potions and leech only. Mana regenerates slowly. Six skills on the bar by M2: a
+builder, a spender, an AoE, a defensive, a movement/escape, a long-cooldown
+ultimate — each with cast time or animation lock, mana cost, cooldown, and a
+reason to exist. Death drops a corpse carrying your gear; you run back naked to
+retrieve it.
+
+**Controls are the first thing tested:** input buffering, animation cancelling
+on the back half of swings, no dead frames. If movement feels floaty, nothing
+else matters.
+
+## Enemies — the pull system is the heart
+
+Authored packs of 3-8 with roles (bruisers front, casters back, a leader that
+buffs). Aggro radius plus social aggro; packs within link radius chain.
+Patrols on fixed 20-40s routes crossing between static packs. Runners flee at
+low HP and aggro the next pack. Casters hold range and reposition for line of
+sight, so the player can pull around corners onto ground they chose. Packs
+leash and reset at full HP. Roster target: swarm melee, skeleton warrior with
+block, skeleton archer, caster, bloated exploder, telegraphed brute, summoner
+(priority target), stealther. Champions carry two affixes; named rares have
+fixed placement and better loot. The player needs a stun and a slow so a bad
+pull is *barely* recoverable by skill.
 
 ---
 
@@ -32,7 +88,15 @@ draw calls, or triangle counts being in band.
 
 ---
 
-## Part 2 — Colour script: Blighted Forest (M1)
+## Part 2 — Colour script
+
+**Superseded for the primary target.** Part 0 moves the graphics target to
+Diablo 1 interiors: stone greys, dried-blood reds, candle golds, sickly greens,
+darkness as a gameplay resource. The forest script below still governs the
+surface zone, but the surface zone is now a funnel to the dungeon, not the
+showcase. Interior colour script is written before interior work begins.
+
+### Blighted Forest (surface funnel)
 
 No zone is built from vibes. Every zone gets its section here **before** work
 begins.

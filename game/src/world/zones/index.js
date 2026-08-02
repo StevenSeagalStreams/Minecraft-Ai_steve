@@ -38,7 +38,10 @@ const ZONES = {
 
 export const ZONE_NAMES = Object.keys(ZONES);
 
-export const DEFAULT_ZONE = 'forest';
+// Interiors dominate. Per the direction mandate the surface zone exists to
+// funnel the player underground, so the build boots into the dungeon -- the
+// place the game actually is -- rather than the showcase exterior.
+export const DEFAULT_ZONE = 'catacombs';
 
 export async function createZone(name, ctx) {
   const factory = ZONES[name] || ZONES[DEFAULT_ZONE];

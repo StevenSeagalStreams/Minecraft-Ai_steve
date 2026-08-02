@@ -44,7 +44,7 @@ const args = parseArgs(process.argv.slice(2));
 const PORT = Number(args.port ?? 5199);
 const SEED = args.seed ?? '20250731';
 const QUALITY = args.quality ?? 'ultra';
-const ZONE = args.zone ?? 'forest';
+const ZONE = args.zone ?? 'catacombs';
 const WIDTH = Number(args.width ?? 1920);
 const HEIGHT = Number(args.height ?? 1080);
 
